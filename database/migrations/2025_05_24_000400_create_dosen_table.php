@@ -20,8 +20,13 @@ return new class extends Migration
             $table->text('alamat')->nullable();
             $table->string('no_telepon', 20)->nullable();
             $table->enum('status', ['Aktif', 'Cuti', 'Keluar', 'Pensiun'])->default('Aktif');
-            $table->unsignedBigInteger('prodi_id')->nullable(); // Define column, FK added later
+            $table->unsignedBigInteger('prodi_id')->nullable();
             $table->timestamps();
+
+            // Menambahkan foreign key constraint
+            $table->foreign('prodi_id')
+                  ->references('id_prodi')->on('program_studi')
+                  ->onDelete('set null'); // Sesuaikan onDelete jika perlu
         });
     }
 

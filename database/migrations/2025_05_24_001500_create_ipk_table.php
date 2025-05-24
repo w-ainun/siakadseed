@@ -10,7 +10,13 @@ return new class extends Migration
     {
         Schema::create('ipk', function (Blueprint $table) {
             $table->id('id_ipk');
-            $table->foreignId('mahasiswa_id')->constrained('mahasiswa', 'nim')->onDelete('cascade')->unique();
+
+            // Mengubah mahasiswa_id agar sesuai dengan tipe mahasiswa.nim (string)
+            // dan mempertahankan unique constraint
+            $table->string('mahasiswa_id', 20)->unique(); // Sesuaikan panjang '20' jika nim di tabel mahasiswa berbeda
+            $table->foreign('mahasiswa_id')->references('nim')->on('mahasiswa')->onDelete('cascade');
+
+            // Kolom lain tetap sama
             $table->decimal('ipk', 3, 2); // e.g. 3.75
             $table->integer('total_sks');
             $table->timestamps();

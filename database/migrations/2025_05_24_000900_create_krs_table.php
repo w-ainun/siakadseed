@@ -10,7 +10,12 @@ return new class extends Migration
     {
         Schema::create('krs', function (Blueprint $table) {
             $table->id('id_krs');
-            $table->foreignId('mahasiswa_id')->constrained('mahasiswa', 'nim')->onDelete('cascade');
+
+            // Mengubah mahasiswa_id agar sesuai dengan tipe mahasiswa.nim (string)
+            $table->string('mahasiswa_id', 20); // Sesuaikan panjang '20' jika nim di tabel mahasiswa berbeda
+            $table->foreign('mahasiswa_id')->references('nim')->on('mahasiswa')->onDelete('cascade');
+
+            // Kolom lain tetap sama, asumsi foreign key ke tahun_akademik sudah benar
             $table->foreignId('tahun_akademik_id')->constrained('tahun_akademik', 'id_tahunakademik')->onDelete('cascade');
             $table->dateTime('tanggal_pengajuan')->useCurrent();
             $table->dateTime('tanggal_persetujuan')->nullable();

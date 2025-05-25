@@ -12,8 +12,6 @@ use App\Models\KrsDetail;
 use App\Models\KomponenNilai;
 use App\Models\Nilai;
 use App\Models\NilaiAkhir;
-use App\Models\Dosen;
-// use App\Models\Absensi; // Uncomment if you want to seed absensi
 use Illuminate\Support\Collection;
 use Carbon\Carbon;
 use Faker\Factory as FakerFactory;
@@ -21,9 +19,9 @@ use Faker\Factory as FakerFactory;
 class KrsNilaiSeeder extends Seeder
 {
     protected $faker;
-    // Cache for performance
-    protected $kelasCache = [];
-    protected $komponenNilaiCache = [];
+    protected $groupedMataKuliahCache = [];
+    protected $availableKelasCache = [];
+    protected $komponenNilaiCache = []; 
 
     public function __construct()
     {
@@ -32,173 +30,304 @@ class KrsNilaiSeeder extends Seeder
 
     public function run()
     {
-        $this->command->info('Starting KRS, Kelas, and Nilai Seeding...');
+        DB::disableQueryLog(); // Nonaktifkan query log di awal
+        $this->command->info('Starting KRS and Nilai Seeding (Kelas are expected to exist)...');
 
         $allTahunAkademik = TahunAkademik::orderBy('tahun_akademik')->orderBy('semester')->get();
-        // Eager load kurikulum and its programStudi relationship
-        $allMataKuliah = MataKuliah::with('kurikulum.programStudi')->get();
-        $dosenIds = Dosen::pluck('id_dosen')->toArray();
+        $allMataKuliahRaw = MataKuliah::with('kurikulum.programStudi')->whereHas('kurikulum', function ($query) {
+            $query->where('is_active', true);
+        })->get();
+        
+        
 
-        if ($allMataKuliah->isEmpty() || empty($dosenIds) || $allTahunAkademik->isEmpty()) {
-            $this->command->error("Master data (Mata Kuliah/Dosen/Tahun Akademik) is missing. Aborting KrsNilaiSeeder.");
+        if ($allMataKuliahRaw->isEmpty() /*|| $dosenCount === 0*/ || $allTahunAkademik->isEmpty()) {
+            $this->command->error("Master data (Mata Kuliah aktif/Tahun Akademik) is missing. Aborting KrsNilaiSeeder.");
+            DB::enableQueryLog();
             return;
         }
+
+        $this->groupedMataKuliahCache = $allMataKuliahRaw->filter(function ($mk) {
+            return $mk->kurikulum && $mk->kurikulum->programStudi;
+        })->groupBy(function ($mk) {
+            return $mk->kurikulum->programStudi->id_prodi . '_' . $mk->semester;
+        });
+        unset($allMataKuliahRaw);
+
+        $this->command->info('Pre-caching active Kelas...');
+        $allRelevantKelas = Kelas::where('is_active', true)
+            ->whereIn('tahun_akademik_id', $allTahunAkademik->pluck('id_tahunakademik')->all())
+            ->get();
+
+        foreach ($allRelevantKelas as $kelas) {
+            $cacheKey = $kelas->tahun_akademik_id . '-' . $kelas->mata_kuliah_id; 
+            if (!isset($this->availableKelasCache[$cacheKey])) {
+                $this->availableKelasCache[$cacheKey] = collect();
+            }
+            $this->availableKelasCache[$cacheKey]->push($kelas);
+        }
+        unset($allRelevantKelas);
+        $this->command->info('Kelas pre-caching finished.');
+
 
         $mahasiswaCount = Mahasiswa::count();
         $progressBar = $this->command->getOutput()->createProgressBar($mahasiswaCount);
         $progressBar->start();
 
-        // Process mahasiswa in chunks to manage memory
-        // Eager load the programStudi relationship for Mahasiswa
-        Mahasiswa::with('programStudi')->chunkById(200, function (Collection $mahasiswas) use ($allTahunAkademik, $allMataKuliah, $dosenIds, $progressBar) {
+        Mahasiswa::with('programStudi')->chunkById(300, function (Collection $mahasiswas) use ($allTahunAkademik, $progressBar) {
+            
+            $simulatedCurrentYear = 2026;
+            $currentChunkTimestamp = Carbon::now();
+            
+            $krsContextCollection = []; 
+            $komponenNilaiForChunkUpsert = []; 
+
             foreach ($mahasiswas as $mahasiswa) {
                 $tahunMasukMahasiswa = (int) $mahasiswa->tahun_masuk;
-                $maxSemesterStudi = 8; // Default for S1
+                $maxSemesterStudiKurikulum = 8; // Default S1
 
-                // Use the correct relationship name 'programStudi' and check for null
                 if ($mahasiswa->programStudi && $mahasiswa->programStudi->jenjang === 'D3') {
-                    $maxSemesterStudi = 6;
+                    $maxSemesterStudiKurikulum = 6;
                 } elseif (!$mahasiswa->programStudi) {
-                    $this->command->warn("Mahasiswa dengan NIM {$mahasiswa->nim} tidak memiliki Program Studi yang valid atau prodi_id tidak ditemukan. KRS tidak akan dibuat untuk mahasiswa ini pada beberapa/semua semester.");
-                    // You might want to skip this student entirely for KRS generation if prodi is crucial and missing
-                    // continue; // Uncomment to skip this student
+                    $this->command->warn("Mahasiswa NIM {$mahasiswa->nim} tidak memiliki program studi. Dilewati.");
+                    $progressBar->advance();
+                    continue;
                 }
+                $prodiIdMahasiswa = $mahasiswa->prodi_id;
 
-                // $currentSemesterSequence = 1; // This variable was defined but not used effectively for semester mapping in the loop.
-                                             // $studentSemesterForThisTA calculates the student's current semester directly.
+                $semestersToGenerateFor = 0;
+                if ($simulatedCurrentYear > $tahunMasukMahasiswa) {
+                    $semestersToGenerateFor = ($simulatedCurrentYear - $tahunMasukMahasiswa) * 2;
+                }
 
                 foreach ($allTahunAkademik as $ta) {
                     $tahunAkademikParts = explode('/', $ta->tahun_akademik);
                     $startYearTA = (int) $tahunAkademikParts[0];
 
-                    if ($startYearTA < $tahunMasukMahasiswa) {
-                        continue;
-                    }
+                    if ($startYearTA < $tahunMasukMahasiswa) continue;
 
                     $studentSemesterForThisTA = (($startYearTA - $tahunMasukMahasiswa) * 2) + ($ta->semester === 'Ganjil' ? 1 : 2);
 
-                    if ($studentSemesterForThisTA <= 0 || $studentSemesterForThisTA > $maxSemesterStudi) {
-                        continue;
-                    }
-                    
-                    // If Program Studi for the student is not found, skip KRS generation for this TA
-                    if (!$mahasiswa->programStudi) {
+                    if ($studentSemesterForThisTA <= 0 || 
+                        $studentSemesterForThisTA > $semestersToGenerateFor ||
+                        $studentSemesterForThisTA > $maxSemesterStudiKurikulum) {
                         continue;
                     }
 
-                    if ($startYearTA > 2024) {
-                        continue;
-                    }
+                    $statusKrs = 'Disetujui'; 
+                    $academicYearMidPoint = Carbon::createFromDate($startYearTA, ($ta->semester === 'Ganjil' ? 9 : 3), 15);
+                    $pengajuanKrs = $this->faker->dateTimeBetween($academicYearMidPoint->copy()->subMonth(), $academicYearMidPoint);
+                    $persetujuanKrs = Carbon::instance($pengajuanKrs)->addDays($this->faker->numberBetween(1, 14))->toDateTimeString();
 
-                    $targetCurriculumSemester = $studentSemesterForThisTA;
-                    $prodiIdMahasiswa = $mahasiswa->prodi_id; // Get the prodi_id from the mahasiswa table directly
 
-                    // Filter mata kuliah from the preloaded collection
-                    $matakuliahUntukSemesterIni = $allMataKuliah->filter(function ($mk) use ($prodiIdMahasiswa, $targetCurriculumSemester) {
-                        return $mk->kurikulum && // Ensure kurikulum relationship is loaded
-                               $mk->kurikulum->programStudi && // Ensure programStudi on kurikulum is loaded
-                               $mk->kurikulum->programStudi->id_prodi == $prodiIdMahasiswa &&
-                               $mk->kurikulum->is_active &&
-                               $mk->semester == $targetCurriculumSemester;
-                    });
+                    $krsContext = new \StdClass();
+                    $krsContext->unique_key = $mahasiswa->nim . '-' . $ta->id_tahunakademik;
+                    $krsContext->mahasiswa_id = $mahasiswa->nim;
+                    $krsContext->tahun_akademik_id = $ta->id_tahunakademik;
+                    $krsContext->tanggal_pengajuan = $pengajuanKrs;
+                    $krsContext->tanggal_persetujuan = $persetujuanKrs;
+                    $krsContext->status = $statusKrs;
+                    $krsContext->catatan = $this->faker->optional(0.1)->sentence();
+                    $krsContext->created_at = $currentChunkTimestamp; 
+                    $krsContext->updated_at = $currentChunkTimestamp; 
+                    $krsContext->details_context = [];
+                    $krsContext->total_sks = 0;
+
+                    $matakuliahUntukSemesterIni = $this->groupedMataKuliahCache->get($prodiIdMahasiswa . '_' . $studentSemesterForThisTA, collect());
 
                     if ($matakuliahUntukSemesterIni->isNotEmpty()) {
-                        $this->seedKrsDanNilaiUntukSemester(
-                            $mahasiswa,
-                            $ta,
-                            // Shuffle and take a random number of courses (e.g., 5 to 7)
-                            $matakuliahUntukSemesterIni->shuffle()->take($this->faker->numberBetween(min(5, $matakuliahUntukSemesterIni->count()), min(7, $matakuliahUntukSemesterIni->count()))),
-                            $dosenIds
-                        );
+                        $shuffledMataKuliah = $matakuliahUntukSemesterIni->shuffle();
+                        $mkYangBerhasilDitambahkan = 0;
+                        $targetJumlahMk = $this->faker->numberBetween(1, min(7, $shuffledMataKuliah->count()));
+
+                        foreach ($shuffledMataKuliah as $mk) {
+                            if ($mkYangBerhasilDitambahkan >= $targetJumlahMk) break;
+
+                            $availableKelasCacheKey = $ta->id_tahunakademik . '-' . $mk->kode_matakuliah;
+                            $availableKelases = $this->availableKelasCache[$availableKelasCacheKey] ?? collect();
+
+                            if ($availableKelases->isNotEmpty()) {
+                                $kelas = $availableKelases->random();
+                                
+                                $detailContext = new \StdClass();
+                                $detailContext->kelas_id = $kelas->id_kelas;
+                                $detailContext->created_at = $currentChunkTimestamp; 
+                                $detailContext->updated_at = $currentChunkTimestamp; 
+                                $detailContext->kelas_instance = $kelas; 
+                                
+                                $krsContext->details_context[] = $detailContext;
+                                $krsContext->total_sks += $mk->sks;
+                                $mkYangBerhasilDitambahkan++;
+
+                                $komponenConfigs = $this->getKomponenConfigs();
+                                foreach($komponenConfigs as $kConfig) {
+                                    $upsertKey = $kelas->id_kelas . '-' . $kConfig['nama_komponen'];
+                                    $komponenNilaiForChunkUpsert[$upsertKey] = [
+                                        'kelas_id' => $kelas->id_kelas,
+                                        'nama_komponen' => $kConfig['nama_komponen'],
+                                        'bobot' => $kConfig['bobot'],
+                                        'created_at' => $currentChunkTimestamp,
+                                        'updated_at' => $currentChunkTimestamp,
+                                    ];
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (!empty($krsContext->details_context) && $krsContext->total_sks > 0) {
+                        $krsContextCollection[] = $krsContext;
+                    } else {
+                        if ($matakuliahUntukSemesterIni->isNotEmpty() && empty($krsContext->details_context)) {
+                            $this->command->warn("INFO: MHS {$mahasiswa->nim} TA {$ta->tahun_akademik}/{$ta->semester} (Sem {$studentSemesterForThisTA}): MK ada, tidak ada kelas aktif. KRS tidak dibuat.");
+                        } else if ($matakuliahUntukSemesterIni->isEmpty()) {
+                            // $this->command->line("INFO: MHS {$mahasiswa->nim} TA {$ta->tahun_akademik}/{$ta->semester} (Sem {$studentSemesterForThisTA}): Tidak ada MK di kurikulum. KRS tidak dibuat.");
+                        }
+                    }
+                } 
+                $progressBar->advance();
+            } 
+
+            if (!empty($komponenNilaiForChunkUpsert)) {
+                KomponenNilai::upsert(
+                    array_values($komponenNilaiForChunkUpsert),
+                    ['kelas_id', 'nama_komponen'], 
+                    ['bobot', 'updated_at'] 
+                );
+                
+                $kelasIdsProcessed = collect($komponenNilaiForChunkUpsert)->pluck('kelas_id')->unique();
+                $namaKomponenProcessed = collect($komponenNilaiForChunkUpsert)->pluck('nama_komponen')->unique();
+                
+                if ($kelasIdsProcessed->isNotEmpty() && $namaKomponenProcessed->isNotEmpty()) {
+                    $actualKomponenNilai = KomponenNilai::whereIn('kelas_id', $kelasIdsProcessed)
+                                                        ->whereIn('nama_komponen', $namaKomponenProcessed)
+                                                        ->get();
+                    foreach($actualKomponenNilai as $kn) {
+                        $this->komponenNilaiCache[$kn->kelas_id . '-' . $kn->nama_komponen] = $kn;
                     }
                 }
-                $progressBar->advance();
             }
-        });
+
+
+            if (empty($krsContextCollection)) return;
+
+            $krsInsertBatch = [];
+            foreach ($krsContextCollection as $krsCtx) {
+                $krsInsertBatch[] = [
+                    'mahasiswa_id' => $krsCtx->mahasiswa_id,
+                    'tahun_akademik_id' => $krsCtx->tahun_akademik_id,
+                    'tanggal_pengajuan' => $krsCtx->tanggal_pengajuan,
+                    'tanggal_persetujuan' => $krsCtx->tanggal_persetujuan,
+                    'status' => $krsCtx->status,
+                    'catatan' => $krsCtx->catatan,
+                    'total_sks' => $krsCtx->total_sks,
+                    'created_at' => $krsCtx->created_at,
+                    'updated_at' => $krsCtx->updated_at,
+                ];
+            }
+            if (!empty($krsInsertBatch)) {
+                Krs::insert($krsInsertBatch);
+            }
+
+
+            $krsIdMap = []; 
+            $mahasiswaNimsInChunk = collect($krsInsertBatch)->pluck('mahasiswa_id')->unique()->all(); // Ambil dari batch yg benar-benar akan diinsert
+            $tahunAkademikIdsInContext = collect($krsInsertBatch)->pluck('tahun_akademik_id')->unique()->all(); // Ambil dari batch
+
+            if (!empty($krsInsertBatch)) {
+                $timeWindowStart = $currentChunkTimestamp->copy()->subSeconds(10); // Kurangi jadi 10 detik
+                $timeWindowEnd = $currentChunkTimestamp->copy()->addSeconds(10); // Kurangi jadi 10 detik
+
+                if (!empty($mahasiswaNimsInChunk) && !empty($tahunAkademikIdsInContext)) {
+                     $insertedKrsModels = Krs::whereIn('mahasiswa_id', $mahasiswaNimsInChunk)
+                        ->whereIn('tahun_akademik_id', $tahunAkademikIdsInContext) 
+                        ->where('created_at', '>=', $timeWindowStart) 
+                        ->where('created_at', '<=', $timeWindowEnd)
+                        ->select('id_krs', 'mahasiswa_id', 'tahun_akademik_id')
+                        ->get();
+                    foreach ($insertedKrsModels as $krsModel) {
+                        $krsIdMap[$krsModel->mahasiswa_id . '-' . $krsModel->tahun_akademik_id] = $krsModel->id_krs;
+                    }
+                }
+            }
+
+            $krsDetailInsertBatch = [];
+            $krsDetailInternalMap = []; 
+            foreach ($krsContextCollection as $krsCtx) {
+                $actualKrsId = $krsIdMap[$krsCtx->unique_key] ?? null;
+                if ($actualKrsId && !empty($krsCtx->details_context)) { 
+                    foreach ($krsCtx->details_context as $detailCtx) {
+                        $krsDetailInsertBatch[] = [
+                            'krs_id' => $actualKrsId,
+                            'kelas_id' => $detailCtx->kelas_id,
+                            'created_at' => $detailCtx->created_at,
+                            'updated_at' => $detailCtx->updated_at,
+                        ];
+                        $krsDetailInternalMap[$actualKrsId . '-' . $detailCtx->kelas_id] = [
+                            'kelas_instance' => $detailCtx->kelas_instance,
+                        ];
+                    }
+                }
+            }
+            if(!empty($krsDetailInsertBatch)) {
+                KrsDetail::insert($krsDetailInsertBatch);
+            }
+            
+            if (!empty($krsDetailInsertBatch)) { 
+                $krsIdsForDetailQuery = collect($krsDetailInsertBatch)->pluck('krs_id')->unique()->all();
+                $kelasIdsForDetailQuery = collect($krsDetailInsertBatch)->pluck('kelas_id')->unique()->all();
+                
+                $timeWindowStartDetail = $currentChunkTimestamp->copy()->subSeconds(10); // Kurangi jadi 10 detik
+                $timeWindowEndDetail = $currentChunkTimestamp->copy()->addSeconds(10); // Kurangi jadi 10 detik
+                
+                if (!empty($krsIdsForDetailQuery) && !empty($kelasIdsForDetailQuery)) {
+                    $insertedKrsDetailModels = KrsDetail::whereIn('krs_id', $krsIdsForDetailQuery) 
+                        ->whereIn('kelas_id', $kelasIdsForDetailQuery) 
+                        ->where('created_at', '>=', $timeWindowStartDetail)
+                        ->where('created_at', '<=', $timeWindowEndDetail)
+                        ->select('id_krsdetail', 'krs_id', 'kelas_id')
+                        ->get();
+                    foreach ($insertedKrsDetailModels as $krsDetailModel) {
+                        $mapKey = $krsDetailModel->krs_id . '-' . $krsDetailModel->kelas_id;
+                        if(isset($krsDetailInternalMap[$mapKey])) { 
+                            $krsDetailInternalMap[$mapKey]['id_krsdetail'] = $krsDetailModel->id_krsdetail;
+                        }
+                    }
+                }
+            }
+
+            $nilaiToInsert = [];
+            $nilaiAkhirToInsert = [];
+            if(!empty($krsDetailInternalMap)){ 
+                foreach ($krsDetailInternalMap as $contextKey => $contextData) { 
+                    if (isset($contextData['id_krsdetail']) && $contextData['id_krsdetail']) {
+                        $mockKrsDetail = new KrsDetail(); 
+                        $mockKrsDetail->id_krsdetail = $contextData['id_krsdetail'];
+                        
+                        $nilaiData = $this->prepareDetailNilaiForBulk($mockKrsDetail, $contextData['kelas_instance'], $currentChunkTimestamp);
+                        $nilaiToInsert = array_merge($nilaiToInsert, $nilaiData['nilai']);
+                        if ($nilaiData['nilai_akhir'] !== null) {
+                            $nilaiAkhirToInsert[] = $nilaiData['nilai_akhir'];
+                        }
+                    }
+                }
+            }
+
+            if (!empty($nilaiToInsert)) {
+                Nilai::insert($nilaiToInsert);
+            }
+            if (!empty($nilaiAkhirToInsert)) {
+                NilaiAkhir::insert($nilaiAkhirToInsert);
+            }
+
+
+        }); 
 
         $progressBar->finish();
         $this->command->line('');
-        $this->command->info('KRS, Kelas, and Nilai Seeding Finished.');
+        $this->command->info('KRS and Nilai Seeding Finished.');
+        DB::enableQueryLog();
     }
 
-    private function seedKrsDanNilaiUntukSemester(Mahasiswa $mahasiswa, TahunAkademik $ta, Collection $selectedMks, array $dosenIds)
-    {
-        if ($selectedMks->isEmpty()) {
-            return;
-        }
-
-        // Check if KRS already exists for this student and TA to prevent duplicates
-        $existingKrs = Krs::where('mahasiswa_id', $mahasiswa->nim)
-                           ->where('tahun_akademik_id', $ta->id_tahunakademik)
-                           ->first();
-        if ($existingKrs) {
-            // Optional: Log or inform that KRS already exists
-            // $this->command->info("KRS for Mahasiswa {$mahasiswa->nim} in TA {$ta->tahun_akademik} {$ta->semester} already exists. Skipping.");
-            return;
-        }
-
-
-        $krs = Krs::factory()->create([
-            'mahasiswa_id' => $mahasiswa->nim,
-            'tahun_akademik_id' => $ta->id_tahunakademik,
-            'status' => $this->faker->randomElement(['Disetujui', 'Diajukan', 'Draft']),
-            'total_sks' => 0, // Will be updated
-        ]);
-
-        $totalSksKrs = 0;
-
-        foreach ($selectedMks as $mk) {
-            if (empty($dosenIds)) {
-                // $this->command->warn("No Dosen IDs available to assign to Kelas for MK: {$mk->kode_matakuliah}. Skipping Kelas creation.");
-                continue; // Skip if no lecturers are available
-            }
-
-            $kelasCacheKey = $ta->id_tahunakademik . '-' . $mk->kode_matakuliah . '-' . ($mk->kurikulum->programStudi->id_prodi ?? 'shared'); // Make cache key more specific if classes can be shared or prodi specific
-            
-            if (!isset($this->kelasCache[$kelasCacheKey])) {
-                $jamMulai = $this->faker->randomElement(['08:00:00', '10:30:00', '13:00:00', '15:30:00']);
-                $durasiJam = ceil($mk->sks / 2); // Simple duration logic, 2 sks = 1-2 hours, 3-4 sks = 2 hours
-                if ($mk->sks == 1) $durasiJam = 1;
-
-
-                // Use firstOrCreate for Kelas to avoid duplicates for the same MK in the same TA
-                $this->kelasCache[$kelasCacheKey] = Kelas::firstOrCreate(
-                    [
-                        'tahun_akademik_id' => $ta->id_tahunakademik,
-                        'mata_kuliah_id' => $mk->kode_matakuliah, // Assumes mata_kuliah_id in 'kelas' table references 'kode_matakuliah' in 'mata_kuliah'
-                        // Consider adding a unique class identifier if multiple parallel classes exist e.g., 'A', 'B'
-                        // 'nama_kelas' => $mk->nama_mk . ' - Kelas A' // Example
-                    ],
-                    [
-                        'dosen_id' => $dosenIds[array_rand($dosenIds)],
-                        'hari' => $this->faker->randomElement(['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat']),
-                        'jam_mulai' => $jamMulai,
-                        'jam_selesai' => Carbon::parse($jamMulai)->addHours($durasiJam)->format('H:i:s'), // Adjusted duration based on SKS
-                        'ruangan' => ($mk->kurikulum->programStudi->singkatan ?? 'R') . '-' . $this->faker->numberBetween(101,309), // Example prodi-based room
-                        'kapasitas' => $this->faker->numberBetween(30, 50),
-                        'is_active' => true,
-                    ]
-                );
-            }
-            $kelas = $this->kelasCache[$kelasCacheKey];
-
-            // Create KrsDetail linking Krs to the Kelas
-            $krsDetail = KrsDetail::create([
-                'krs_id' => $krs->id_krs,
-                'kelas_id' => $kelas->id_kelas,
-            ]);
-            $totalSksKrs += $mk->sks;
-
-            $this->seedDetailNilai($krsDetail, $kelas);
-            
-            // Optionally seed Absensi
-            // ... (kode absensi Anda)
-        }
-        $krs->total_sks = $totalSksKrs;
-        $krs->save();
-    }
-
-    private function seedDetailNilai(KrsDetail $krsDetail, Kelas $kelas)
+    private function getKomponenConfigs(): array
     {
         $komponenConfigs = [
             ['nama_komponen' => 'Tugas Harian', 'bobot' => $this->faker->numberBetween(15, 25)],
@@ -208,44 +337,53 @@ class KrsNilaiSeeder extends Seeder
         $komponenConfigs[] = ['nama_komponen' => 'Ujian Akhir Semester (UAS)', 'bobot' => max(20, $sisaBobot)];
 
         $totalBobot = array_sum(array_column($komponenConfigs, 'bobot'));
-        if ($totalBobot !== 100 && $totalBobot > 0) { // Avoid division by zero if totalBobot is 0
+        if ($totalBobot !== 100 && $totalBobot > 0) {
             $factor = 100 / $totalBobot;
-            foreach($komponenConfigs as &$cfg) {
-                $cfg['bobot'] = round($cfg['bobot'] * $factor);
+            $currentSumBobot = 0;
+            for ($i = 0; $i < count($komponenConfigs) - 1; $i++) {
+                $komponenConfigs[$i]['bobot'] = round($komponenConfigs[$i]['bobot'] * $factor);
+                $currentSumBobot += $komponenConfigs[$i]['bobot'];
             }
-            unset($cfg);
-            $currentSum = array_sum(array_map(function($c){ return $c['bobot']; }, array_slice($komponenConfigs, 0, -1)));
-            if (count($komponenConfigs) > 0) { // Ensure there's at least one component
-                 $komponenConfigs[count($komponenConfigs)-1]['bobot'] = 100 - $currentSum;
-            }
-        } elseif (empty($komponenConfigs)) {
-            // $this->command->warn("No komponen nilai configured for Kelas ID: {$kelas->id_kelas}. Nilai tidak akan di-seed.");
-            return; // No components, no grades
+            $komponenConfigs[count($komponenConfigs)-1]['bobot'] = 100 - $currentSumBobot;
         }
+        $finalBobotSum = array_sum(array_column($komponenConfigs, 'bobot'));
+        if ($finalBobotSum !== 100 && count($komponenConfigs) > 0) {
+            $komponenConfigs[count($komponenConfigs)-1]['bobot'] += (100 - $finalBobotSum);
+        }
+        return $komponenConfigs;
+    }
 
 
+    private function prepareDetailNilaiForBulk(KrsDetail $krsDetail, Kelas $kelas, Carbon $timestamp): array
+    {
+        $komponenConfigs = $this->getKomponenConfigs(); 
+
+        $nilaiDataArray = [];
         $totalNilaiWeighted = 0;
 
         foreach ($komponenConfigs as $config) {
-             // Ensure bobot is not zero to prevent issues if it was rounded down or misconfigured
-            if ($config['bobot'] <= 0) continue;
+            if ($config['bobot'] <= 0) continue; 
 
-            $komponenCacheKey = $kelas->id_kelas . '-' . $config['nama_komponen'];
-            if (!isset($this->komponenNilaiCache[$komponenCacheKey])) {
-                $this->komponenNilaiCache[$komponenCacheKey] = KomponenNilai::firstOrCreate(
-                    ['kelas_id' => $kelas->id_kelas, 'nama_komponen' => $config['nama_komponen']],
-                    ['bobot' => $config['bobot']]
-                );
+            $komponenNilai = $this->komponenNilaiCache[$kelas->id_kelas . '-' . $config['nama_komponen']] ?? null;
+
+            if (!$komponenNilai) {
+                $this->command->error("CRITICAL: KomponenNilai tidak ada di cache untuk Kelas ID {$kelas->id_kelas}, Komponen '{$config['nama_komponen']}'. Nilai tidak dapat dibuat. Pastikan upsert KomponenNilai berhasil & cache direfresh.");
+                continue; 
             }
-            $komponenNilai = $this->komponenNilaiCache[$komponenCacheKey];
 
             $nilaiAngkaKomponen = $this->faker->randomFloat(2, 45, 98);
-            Nilai::create([
-                'krs_detail_id' => $krsDetail->id_krsdetail,
+            $nilaiDataArray[] = [
+                'krs_detail_id' => $krsDetail->id_krsdetail, 
                 'komponen_nilai_id' => $komponenNilai->id_komponennilai,
                 'nilai_angka' => $nilaiAngkaKomponen,
-            ]);
+                'created_at' => $timestamp, 
+                'updated_at' => $timestamp, 
+            ];
             $totalNilaiWeighted += ($nilaiAngkaKomponen * ($komponenNilai->bobot / 100.0));
+        }
+
+        if (empty($nilaiDataArray)) {
+            return ['nilai' => [], 'nilai_akhir' => null];
         }
 
         $nilaiAngkaAkhir = round(max(0, min(100, $totalNilaiWeighted)), 2);
@@ -257,10 +395,15 @@ class KrsNilaiSeeder extends Seeder
         elseif ($nilaiAngkaAkhir >= 60) $nilaiHuruf = 'C';
         elseif ($nilaiAngkaAkhir >= 50) $nilaiHuruf = 'D';
 
-        NilaiAkhir::create([
-            'krs_detail_id' => $krsDetail->id_krsdetail,
+        $nilaiAkhirData = [
+            'krs_detail_id' => $krsDetail->id_krsdetail, 
             'nilai_angka' => $nilaiAngkaAkhir,
             'nilai_huruf' => $nilaiHuruf,
-        ]);
+            'created_at' => $timestamp, 
+            'updated_at' => $timestamp, 
+        ];
+
+
+        return ['nilai' => $nilaiDataArray, 'nilai_akhir' => $nilaiAkhirData];
     }
 }

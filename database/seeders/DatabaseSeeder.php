@@ -16,11 +16,6 @@ class DatabaseSeeder extends Seeder
     public function run()
     {
         $this->command->info('Starting database seeding process...');
-
-        // Temporarily disable foreign key checks for performance
-        // Schema::disableForeignKeyConstraints(); // Preferred Laravel way
-
-        // Fallback for direct DB commands if needed, Schema facade is better
         if (DB::getDriverName() === 'mysql') {
             DB::statement('SET FOREIGN_KEY_CHECKS=0;');
         } elseif (DB::getDriverName() === 'sqlite') {
@@ -29,14 +24,10 @@ class DatabaseSeeder extends Seeder
 
         $this->call([
             MasterDataSeeder::class,
+            MataKuliahKelasSeeder::class,
             MahasiswaSeeder::class,
             KrsNilaiSeeder::class,
-            // Add other seeders here if any
         ]);
-
-        // Re-enable foreign key checks
-        // Schema::enableForeignKeyConstraints(); // Preferred Laravel way
-
         if (DB::getDriverName() === 'mysql') {
             DB::statement('SET FOREIGN_KEY_CHECKS=1;');
         } elseif (DB::getDriverName() === 'sqlite') {

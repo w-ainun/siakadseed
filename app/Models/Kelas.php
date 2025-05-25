@@ -16,8 +16,6 @@ class Kelas extends Model
     protected $casts = [
         'is_active' => 'boolean',
         'kapasitas' => 'integer',
-        // 'jam_mulai' => 'datetime:H:i:s', // Or handle as string
-        // 'jam_selesai' => 'datetime:H:i:s',
     ];
 
     public function tahunAkademik()

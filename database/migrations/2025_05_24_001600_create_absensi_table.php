@@ -11,14 +11,11 @@ return new class extends Migration
         Schema::create('absensi', function (Blueprint $table) {
             $table->id('id_absensi');
 
-            // Asumsi kelas.id_kelas adalah unsignedBigInteger (dibuat dengan $table->id('id_kelas'))
             $table->foreignId('kelas_id')->constrained('kelas', 'id_kelas')->onDelete('cascade');
 
-            // Mengubah mahasiswa_id agar sesuai dengan tipe mahasiswa.nim (string)
             $table->string('mahasiswa_id', 20); // Sesuaikan panjang '20' jika nim di tabel mahasiswa berbeda
             $table->foreign('mahasiswa_id')->references('nim')->on('mahasiswa')->onDelete('cascade');
 
-            // Kolom lain tetap sama
             $table->enum('status', ['Hadir', 'Izin', 'Sakit', 'Alpa'])->default('Alpa');
             $table->dateTime('waktu_absen')->nullable();
             $table->text('keterangan')->nullable();

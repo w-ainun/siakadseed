@@ -3,125 +3,110 @@
 namespace Database\Seeders;
 
 use Illuminate\Database\Seeder;
-use App\Models\KrsDetail;
 use App\Models\Absensi;
-use App\Models\Kelas; // Make sure to import Kelas model
+use App\Models\Kelas;
+use App\Models\Mahasiswa;
+use App\Models\TahunAkademik;
+use Illuminate\Support\Facades\DB;
 use Faker\Factory as FakerFactory;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\Log;
 
 class AbsensiSeeder extends Seeder
 {
     protected $faker;
+    protected $batchSize = 2000; // Meningkatkan ukuran batch
 
     public function __construct()
     {
         $this->faker = FakerFactory::create('id_ID');
     }
 
-    /**
-     * Run the database seeds.
-     *
-     * @return void
-     */
     public function run()
     {
-        $this->command->info('Starting Absensi Seeding...');
+        $this->command->info('Memulai seeding data Absensi...');
 
-        // Retrieve KrsDetail records that have corresponding Krs with 'Disetujui' status
-        $krsDetails = KrsDetail::whereHas('krs', function ($query) {
-            $query->where('status', 'Disetujui');
-        })->with('krs', 'kelas')->get();
+        DB::statement('SET FOREIGN_KEY_CHECKS=0;');
+        DB::table('absensi')->truncate();
+        DB::statement('SET FOREIGN_KEY_CHECKS=1;');
 
-        if ($krsDetails->isEmpty()) {
-            $this->command->warn('No approved KRS Details found. Skipping Absensi seeding.');
+        $mahasiswas = Mahasiswa::all()->keyBy('nim'); // KeyBy untuk akses cepat
+        // Eager load mataKuliah dan kurikulum untuk filter prodi, dan keyBy
+        $kelasList = Kelas::with('mataKuliah.kurikulum')->get()->keyBy('id_kelas'); 
+        $tahunAkademiks = TahunAkademik::all()->keyBy('id_tahunakademik');
+
+        if ($mahasiswas->isEmpty() || $kelasList->isEmpty() || $tahunAkademiks->isEmpty()) {
+            $this->command->error('Data dasar (Mahasiswa, Kelas, Tahun Akademik) tidak ditemukan. Seeder dihentikan.');
             return;
         }
 
-        $totalAbsensiRecords = 0;
-        foreach ($krsDetails as $krsDetail) {
-            $kelas = $krsDetail->kelas;
-            $mahasiswaNim = $krsDetail->krs->mahasiswa_id;
+        $totalKelas = $kelasList->count();
+        $progressBar = $this->command->getOutput()->createProgressBar($totalKelas);
+        $progressBar->setFormatDefinition('custom', ' %current%/%max% [%bar%] %percent:3s%% -- %message% (Est: %estimated:-6s% Left: %remaining:-6s%)');
+        $progressBar->setFormat('custom');
+        $progressBar->start();
 
-            if (!$kelas) {
-                $this->command->warn("Kelas with ID {$krsDetail->kelas_id} not found for KrsDetail ID {$krsDetail->id_krsdetail}. Skipping absensi.");
-                continue;
-            }
+        $absensiToInsert = [];
 
-            // Determine start and end dates for the class based on Tahun Akademik
-            $tahunAkademik = $kelas->tahunAkademik;
+        foreach ($kelasList as $kelas) {
+            $progressBar->setMessage("Preparing Absensi data for Kelas: {$kelas->nama_kelas}");
+
+            $tahunAkademik = $tahunAkademiks->get($kelas->tahun_akademik_id);
             if (!$tahunAkademik) {
-                 $this->command->warn("Tahun Akademik not found for Kelas ID {$kelas->id_kelas}. Skipping absensi.");
-                 continue;
+                continue; // Lewati tanpa log
             }
 
-            $startDate = Carbon::parse($tahunAkademik->tanggal_mulai);
-            $endDate = Carbon::parse($tahunAkademik->tanggal_selesai);
+            $numMeetings = $this->faker->numberBetween(14, 16); 
 
-            $pertemuanCount = $this->faker->numberBetween(14, 16); // Simulate 14-16 meetings per class
-            $currentDate = $startDate;
-            $meetingsScheduled = 0;
-
-            for ($i = 1; $i <= $pertemuanCount; $i++) {
-                // Find next occurrence of the class's day
-                $dayOfWeek = $kelas->hari; // e.g., 'Senin'
-                $carbonDayMap = [
-                    'Minggu' => Carbon::SUNDAY,
-                    'Senin' => Carbon::MONDAY,
-                    'Selasa' => Carbon::TUESDAY,
-                    'Rabu' => Carbon::WEDNESDAY,
-                    'Kamis' => Carbon::THURSDAY,
-                    'Jumat' => Carbon::FRIDAY,
-                    'Sabtu' => Carbon::SATURDAY,
-                ];
-
-                if (!isset($carbonDayMap[$dayOfWeek])) {
-                    $this->command->warn("Invalid day: {$dayOfWeek} for Kelas ID {$kelas->id_kelas}. Skipping absensi for this class.");
-                    break;
+            foreach ($mahasiswas as $mahasiswa) {
+                // Cek apakah mahasiswa ini seharusnya ada di kelas ini berdasarkan prodi
+                if (($kelas->mataKuliah->kurikulum->prodi_id ?? null) !== $mahasiswa->prodi_id) {
+                    continue;
                 }
 
-                while ($currentDate->dayOfWeek !== $carbonDayMap[$dayOfWeek]) {
-                    $currentDate->addDay();
-                }
-
-                // If the calculated date exceeds the semester end date, stop scheduling
-                if ($currentDate->greaterThan($endDate)) {
-                    break;
-                }
-
-                $status = $this->faker->randomElement(['Hadir', 'Hadir', 'Hadir', 'Hadir', 'Hadir', 'Izin', 'Sakit', 'Alpa']);
-                $waktuAbsen = ($status === 'Hadir') ? $currentDate->format('Y-m-d') . ' ' . $kelas->jam_mulai : null;
-                $keterangan = ($status !== 'Hadir') ? $this->faker->sentence(3) : null;
-                $isTerlaksana = true; // Assume all scheduled meetings are held
-
-                try {
-                    Absensi::create([
+                for ($pertemuan = 1; $pertemuan <= $numMeetings; $pertemuan++) {
+                    $statusAbsen = $this->faker->randomElement(['Hadir', 'Hadir', 'Hadir', 'Hadir', 'Izin', 'Sakit', 'Alpa']);
+                    $absensiToInsert[] = [
                         'kelas_id' => $kelas->id_kelas,
-                        'mahasiswa_id' => $mahasiswaNim,
-                        'status' => $status,
-                        'waktu_absen' => $waktuAbsen,
-                        'keterangan' => $keterangan,
-                        'pertemuan_ke' => $i,
-                        'tanggal' => $currentDate->toDateString(),
+                        'mahasiswa_id' => $mahasiswa->nim,
+                        'status' => $statusAbsen,
+                        'waktu_absen' => $this->faker->dateTimeBetween($tahunAkademik->tanggal_mulai, $tahunAkademik->tanggal_selesai)->format('Y-m-d H:i:s'),
+                        'keterangan' => ($statusAbsen != 'Hadir') ? $this->faker->sentence(3) : null,
+                        'pertemuan_ke' => $pertemuan,
+                        'tanggal' => $this->faker->dateTimeBetween($tahunAkademik->tanggal_mulai, $tahunAkademik->tanggal_selesai)->format('Y-m-d'),
                         'materi' => $this->faker->sentence(4),
-                        'is_terlaksana' => $isTerlaksana,
-                        'created_at' => Carbon::now(),
-                        'updated_at' => Carbon::now(),
-                    ]);
-                    $totalAbsensiRecords++;
-                    $meetingsScheduled++;
-                } catch (\Illuminate\Database\QueryException $e) {
-                    if (str_contains($e->getMessage(), 'unique_absensi_kelas_mahasiswa')) {
-                        // This unique constraint sometimes causes issues with large datasets and random generation
-                        // For seeding, it's often acceptable to skip duplicates.
-                        // In a real app, you'd likely update or ensure unique generation.
-                        // $this->command->warn("Duplicate absensi entry for kelas {$kelas->id_kelas} and mahasiswa {$mahasiswaNim} on {$currentDate->toDateString()}. Skipping.");
-                    } else {
-                        throw $e; // Re-throw other exceptions
-                    }
+                        'is_terlaksana' => true,
+                        'created_at' => now()->format('Y-m-d H:i:s'),
+                        'updated_at' => now()->format('Y-m-d H:i:s'),
+                    ];
                 }
-                $currentDate->addWeek(); // Move to the next week for the same day
             }
+            $progressBar->advance();
         }
-        $this->command->info("Absensi Seeding Completed! Total records: {$totalAbsensiRecords}");
+        $progressBar->finish();
+
+        $this->command->info("\nInserting Absensi data in batches...");
+        $progressBar = $this->command->getOutput()->createProgressBar(count($absensiToInsert));
+        $progressBar->start();
+
+        // Insert semua data absensi dalam batch yang lebih besar
+        foreach (array_chunk($absensiToInsert, $this->batchSize) as $chunk) { 
+            try {
+                Absensi::insert($chunk);
+            } catch (\Illuminate\Database\QueryException $e) {
+                // Log the error if it's not a duplicate key error
+                if (!str_contains($e->getMessage(), 'unique_absensi_kelas_mahasiswa_pertemuan')) {
+                    Log::error("Error inserting absensi batch: " . $e->getMessage());
+                    throw $e;
+                } else {
+                    // Ini normal jika ada duplikat karena random generation
+                    Log::warning("Duplicate absensi entry detected for batch. Skipping duplicates.");
+                }
+            }
+            $progressBar->advance(count($chunk));
+        }
+        $progressBar->finish();
+
+        $this->command->info("\nSeeding Absensi selesai.");
     }
 }

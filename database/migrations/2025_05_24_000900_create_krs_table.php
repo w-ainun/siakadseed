@@ -23,7 +23,7 @@ return new class extends Migration
             $table->text('catatan')->nullable();
             $table->integer('total_sks')->default(0);
             $table->timestamps();
-
+            $table->string('temp_seed_uuid', 36)->nullable()->unique(); // <-- Tambahkan baris ini
             $table->unique(['mahasiswa_id', 'tahun_akademik_id']);
         });
     }

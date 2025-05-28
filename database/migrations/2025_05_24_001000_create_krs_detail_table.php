@@ -13,7 +13,7 @@ return new class extends Migration
             $table->foreignId('krs_id')->constrained('krs', 'id_krs')->onDelete('cascade');
             $table->foreignId('kelas_id')->constrained('kelas', 'id_kelas')->onDelete('cascade');
             $table->timestamps();
-
+            $table->string('temp_seed_uuid', 36)->nullable()->unique(); // <-- Tambahkan baris ini
             $table->unique(['krs_id', 'kelas_id']);
         });
     }

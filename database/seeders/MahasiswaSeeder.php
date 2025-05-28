@@ -7,9 +7,18 @@ use App\Models\Mahasiswa;
 use App\Models\ProgramStudi;
 use App\Models\Dosen;
 use Illuminate\Support\Facades\Log;
+use Faker\Factory as FakerFactory; // Import Faker for potential future use or if needed by factory()
 
 class MahasiswaSeeder extends Seeder
 {
+    // Add a faker instance if Mahasiswa::factory()->raw() needs it directly here
+    // protected $faker; 
+
+    // public function __construct()
+    // {
+    //     $this->faker = FakerFactory::create('id_ID');
+    // }
+
     public function run()
     {
         $this->command->info('Memulai proses seeding data Mahasiswa...');
@@ -36,7 +45,7 @@ class MahasiswaSeeder extends Seeder
         }
 
         $tahunMasukRange = range(2019, 2024);
-        $mahasiswaPerTahun = 5000;           
+        $mahasiswaPerTahun = 5000;          
         $totalMahasiswaCreated = 0;
         $nimCounters = [];
 
@@ -83,14 +92,21 @@ class MahasiswaSeeder extends Seeder
                 
                 $nim = sprintf("%04d%02d%03d%04d", $tahun, $fakultasId, $prodiId, $nomorUrut);
 
+                // Calculate tahun_lulus_sma
+                // $tahun - 1 to $tahun - 4 years
+                $tahunLulusSma = $tahun - rand(1, 4); 
+
                 $seederProvidedData = [
                     'nim' => $nim,
                     'tahun_masuk' => $tahun,
                     'prodi_id' => $prodiId,
                     'dosen_pa_id' => $dosenPaId,
                     'status' => 'Aktif',
+                    'tahun_lulus_sma' => $tahunLulusSma, // Add this line
                 ];
 
+                // If Mahasiswa::factory()->raw() generates 'tahun_lulus_sma' itself,
+                // you might need to ensure this explicit assignment overwrites it or is compatible.
                 $factoryGeneratedData = Mahasiswa::factory()->raw($seederProvidedData);
 
                 $fullMahasiswaData = array_merge($factoryGeneratedData, $seederProvidedData);

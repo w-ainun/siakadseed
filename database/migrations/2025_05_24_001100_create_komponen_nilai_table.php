@@ -13,6 +13,7 @@ return new class extends Migration
             $table->foreignId('kelas_id')->constrained('kelas', 'id_kelas')->onDelete('cascade');
             $table->string('nama_komponen', 50);
             $table->decimal('bobot', 5, 2); // e.g., 25.00 for 25%
+            $table->string('temp_seed_uuid', 36)->nullable()->unique(); // <-- Tambahkan baris ini
             $table->timestamps();
         });
     }

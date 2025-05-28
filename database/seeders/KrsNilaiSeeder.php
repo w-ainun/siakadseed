@@ -5,405 +5,527 @@ namespace Database\Seeders;
 use Illuminate\Database\Seeder;
 use App\Models\Mahasiswa;
 use App\Models\TahunAkademik;
-use App\Models\MataKuliah;
 use App\Models\Kelas;
-use App\Models\Krs;
-use App\Models\KrsDetail;
-use App\Models\KomponenNilai;
-use App\Models\Nilai;
-use App\Models\NilaiAkhir;
-use Illuminate\Support\Collection;
-use Carbon\Carbon;
+// use App\Models\Krs; // Not directly used for mass insertion, but model exists
+// use App\Models\KrsDetail; // Not directly used for mass insertion
+// use App\Models\KomponenNilai; // Not directly used for mass insertion
+// use App\Models\Nilai; // Not directly used for mass insertion
+// use App\Models\NilaiAkhir; // Not directly used for mass insertion
+use Illuminate\Support\Facades\DB;
 use Faker\Factory as FakerFactory;
+use Carbon\Carbon;
+use Exception;
+use Illuminate\Support\Str; // For UUIDs
 
 class KrsNilaiSeeder extends Seeder
 {
     protected $faker;
-    protected $groupedMataKuliahCache = [];
-    protected $availableKelasCache = [];
-    protected $komponenNilaiCache = []; 
+
+    protected $nilaiHurufMapping = [
+        85 => 'A',
+        80 => 'A-',
+        75 => 'B+',
+        70 => 'B',
+        65 => 'B-',
+        60 => 'C+',
+        55 => 'C',
+        50 => 'C-',
+        45 => 'D',
+        0 => 'E',
+    ];
+
+    // Configuration for data generation scaling
+    protected $maxKrsPerStudentPerYear = 1; // Limit 1 KRS per student per academic year
+    protected $maxKelasPerKrs = 8; // Max classes per KRS
+    protected $minKelasPerKrs = 5; // Min classes per KRS
+    protected $batchSize = 2000; // Optimal batch size (adjust based on memory/DB limits)
 
     public function __construct()
     {
         $this->faker = FakerFactory::create('id_ID');
     }
 
+    /**
+     * Run the database seeds.
+     *
+     * @return void
+     */
     public function run()
     {
-        DB::disableQueryLog(); // Nonaktifkan query log di awal
-        $this->command->info('Starting KRS and Nilai Seeding (Kelas are expected to exist)...');
+        $this->command->info('Starting KRS and Nilai Seeding (Highly Optimized)...');
 
-        $allTahunAkademik = TahunAkademik::orderBy('tahun_akademik')->orderBy('semester')->get();
-        $allMataKuliahRaw = MataKuliah::with('kurikulum.programStudi')->whereHas('kurikulum', function ($query) {
-            $query->where('is_active', true);
-        })->get();
-        
-        
+        // Increase memory limit and execution time if necessary
+        ini_set('memory_limit', '2048M'); // Increased memory for potentially large datasets
+        ini_set('max_execution_time', 7200); // 2 hours (120 minutes)
 
-        if ($allMataKuliahRaw->isEmpty() /*|| $dosenCount === 0*/ || $allTahunAkademik->isEmpty()) {
-            $this->command->error("Master data (Mata Kuliah aktif/Tahun Akademik) is missing. Aborting KrsNilaiSeeder.");
-            DB::enableQueryLog();
+        // Disable query log to save memory and improve performance for large inserts
+        if (DB::connection()->logging()) {
+            DB::connection()->disableQueryLog();
+        }
+        
+        // Temporarily disable foreign key checks for faster inserts, re-enable at the end
+        DB::statement('SET FOREIGN_KEY_CHECKS=0');
+
+        $this->command->info('Fetching essential data...');
+        $mahasiswas = Mahasiswa::select('nim', 'tahun_masuk', 'prodi_id')->get();
+        $tahunAkademiks = TahunAkademik::orderBy('tahun_akademik')
+                                        ->orderByRaw("FIELD(semester, 'Ganjil', 'Genap')")
+                                        ->get();
+        $activeTahunAkademik = TahunAkademik::where('is_active', true)->first();
+
+        // Pre-fetch all necessary Kelas data
+        $kelasCollection = Kelas::with('mataKuliah:kode_matakuliah,sks')
+                                ->where('is_active', true)
+                                ->get()
+                                ->groupBy('tahun_akademik_id'); // Group by TA for faster lookup
+
+        // Pre-fetch existing KRS entries to avoid duplicates (using actual IDs for robustness)
+        $existingKrsMap = DB::table('krs')
+                            ->select('mahasiswa_id', 'tahun_akademik_id')
+                            ->get()
+                            ->mapWithKeys(fn($item) => ["{$item->mahasiswa_id}-{$item->tahun_akademik_id}" => true]);
+
+
+        if ($mahasiswas->isEmpty()) {
+            $this->command->warn('No Mahasiswa found. Skipping KRS and Nilai seeding.');
+            DB::statement('SET FOREIGN_KEY_CHECKS=1');
             return;
         }
-
-        $this->groupedMataKuliahCache = $allMataKuliahRaw->filter(function ($mk) {
-            return $mk->kurikulum && $mk->kurikulum->programStudi;
-        })->groupBy(function ($mk) {
-            return $mk->kurikulum->programStudi->id_prodi . '_' . $mk->semester;
-        });
-        unset($allMataKuliahRaw);
-
-        $this->command->info('Pre-caching active Kelas...');
-        $allRelevantKelas = Kelas::where('is_active', true)
-            ->whereIn('tahun_akademik_id', $allTahunAkademik->pluck('id_tahunakademik')->all())
-            ->get();
-
-        foreach ($allRelevantKelas as $kelas) {
-            $cacheKey = $kelas->tahun_akademik_id . '-' . $kelas->mata_kuliah_id; 
-            if (!isset($this->availableKelasCache[$cacheKey])) {
-                $this->availableKelasCache[$cacheKey] = collect();
-            }
-            $this->availableKelasCache[$cacheKey]->push($kelas);
+        if ($tahunAkademiks->isEmpty()) {
+            $this->command->warn('No Tahun Akademik found. Skipping KRS and Nilai seeding.');
+            DB::statement('SET FOREIGN_KEY_CHECKS=1');
+            return;
         }
-        unset($allRelevantKelas);
-        $this->command->info('Kelas pre-caching finished.');
+        if (!$activeTahunAkademik) {
+            $this->command->warn('No active Tahun Akademik found. Consider running MasterDataSeeder first. Skipping KRS for active semester.');
+        }
 
+        $krsToProcessCount = 0;
+        // Calculate the number of potential KRS entries to set up the progress bar
+        foreach ($mahasiswas as $mahasiswa) {
+            $mahasiswaStartYear = (int) $mahasiswa->tahun_masuk;
+            $semesterOrder = ['Ganjil' => 1, 'Genap' => 2];
+            $mahasiswaStartTaOrder = $mahasiswaStartYear * 10 + $semesterOrder['Ganjil'];
 
-        $mahasiswaCount = Mahasiswa::count();
-        $progressBar = $this->command->getOutput()->createProgressBar($mahasiswaCount);
+            foreach ($tahunAkademiks as $ta) {
+                $taStartYear = (int) explode('/', $ta->tahun_akademik)[0];
+                $currentTaOrder = $taStartYear * 10 + $semesterOrder[$ta->semester];
+
+                if ($currentTaOrder < $mahasiswaStartTaOrder) {
+                    continue;
+                }
+                
+                // Only count if a KRS for this student and TA doesn't already exist
+                if (!$existingKrsMap->has("{$mahasiswa->nim}-{$ta->id_tahunakademik}")) {
+                    // Check if current TA is not in the future beyond active TA
+                    $isCurrentOrFutureTA = false;
+                    if ($activeTahunAkademik) {
+                        $activeTaStartYear = (int) explode('/', $activeTahunAkademik->tahun_akademik)[0];
+                        $activeTaOrder = $activeTaStartYear * 10 + $semesterOrder[$activeTahunAkademik->semester];
+                        if ($currentTaOrder > $activeTaOrder) {
+                            continue; // Skip future TAs beyond active one
+                        }
+                    }
+                    $krsToProcessCount++;
+                }
+            }
+        }
+
+        // Initialize the progress bar
+        $progressBar = $this->command->getOutput()->createProgressBar($krsToProcessCount);
         $progressBar->start();
 
-        Mahasiswa::with('programStudi')->chunkById(300, function (Collection $mahasiswas) use ($allTahunAkademik, $progressBar) {
-            
-            $simulatedCurrentYear = 2026;
-            $currentChunkTimestamp = Carbon::now();
-            
-            $krsContextCollection = []; 
-            $komponenNilaiForChunkUpsert = []; 
+        // Initialize arrays to hold data for batch insertion
+        $allKrsData = [];
+        $allKrsDetailData = [];
+        $allKomponenNilaiData = [];
+        $allNilaiData = [];
+        $allNilaiAkhirData = [];
 
-            foreach ($mahasiswas as $mahasiswa) {
-                $tahunMasukMahasiswa = (int) $mahasiswa->tahun_masuk;
-                $maxSemesterStudiKurikulum = 8; // Default S1
+        // Maps to store temporary UUIDs to actual auto-incrementing IDs after insertion
+        $krsTempToActualIdMap = [];
+        $krsDetailTempToActualIdMap = [];
+        $komponenNilaiTempToActualIdMap = [];
 
-                if ($mahasiswa->programStudi && $mahasiswa->programStudi->jenjang === 'D3') {
-                    $maxSemesterStudiKurikulum = 6;
-                } elseif (!$mahasiswa->programStudi) {
-                    $this->command->warn("Mahasiswa NIM {$mahasiswa->nim} tidak memiliki program studi. Dilewati.");
+        $semesterOrder = ['Ganjil' => 1, 'Genap' => 2];
+        foreach ($mahasiswas as $mahasiswa) {
+            $mahasiswaStartYear = (int) $mahasiswa->tahun_masuk;
+            $mahasiswaProdiId = $mahasiswa->prodi_id; // Get prodi_id once per mahasiswa
+            $mahasiswaStartTaOrder = $mahasiswaStartYear * 10 + $semesterOrder['Ganjil'];
+
+            foreach ($tahunAkademiks as $ta) {
+                $taStartYear = (int) explode('/', $ta->tahun_akademik)[0];
+                $currentTaOrder = $taStartYear * 10 + $semesterOrder[$ta->semester];
+
+                if ($currentTaOrder < $mahasiswaStartTaOrder) {
+                    continue;
+                }
+
+                $isCurrentOrFutureTA = false;
+                if ($activeTahunAkademik) {
+                    $activeTaStartYear = (int) explode('/', $activeTahunAkademik->tahun_akademik)[0];
+                    $activeTaOrder = $activeTaStartYear * 10 + $semesterOrder[$activeTahunAkademik->semester];
+                    if ($currentTaOrder > $activeTaOrder) {
+                        continue;
+                    }
+                    if ($currentTaOrder === $activeTaOrder) {
+                        $isCurrentOrFutureTA = true;
+                    }
+                }
+
+                // Skip if KRS already exists (checked earlier for progress bar, now for actual processing)
+                if ($existingKrsMap->has("{$mahasiswa->nim}-{$ta->id_tahunakademik}")) {
                     $progressBar->advance();
                     continue;
                 }
-                $prodiIdMahasiswa = $mahasiswa->prodi_id;
+                
+                // Get available classes for this TA and Mahasiswa's Prodi
+                // Use the pre-fetched and grouped $kelasCollection
+                $availableKelasForTA = $kelasCollection->get($ta->id_tahunakademik);
 
-                $semestersToGenerateFor = 0;
-                if ($simulatedCurrentYear > $tahunMasukMahasiswa) {
-                    $semestersToGenerateFor = ($simulatedCurrentYear - $tahunMasukMahasiswa) * 2;
+                if ($availableKelasForTA === null || $availableKelasForTA->isEmpty()) {
+                    $progressBar->advance();
+                    continue;
                 }
 
-                foreach ($allTahunAkademik as $ta) {
-                    $tahunAkademikParts = explode('/', $ta->tahun_akademik);
-                    $startYearTA = (int) $tahunAkademikParts[0];
-
-                    if ($startYearTA < $tahunMasukMahasiswa) continue;
-
-                    $studentSemesterForThisTA = (($startYearTA - $tahunMasukMahasiswa) * 2) + ($ta->semester === 'Ganjil' ? 1 : 2);
-
-                    if ($studentSemesterForThisTA <= 0 || 
-                        $studentSemesterForThisTA > $semestersToGenerateFor ||
-                        $studentSemesterForThisTA > $maxSemesterStudiKurikulum) {
-                        continue;
-                    }
-
-                    $statusKrs = 'Disetujui'; 
-                    $academicYearMidPoint = Carbon::createFromDate($startYearTA, ($ta->semester === 'Ganjil' ? 9 : 3), 15);
-                    $pengajuanKrs = $this->faker->dateTimeBetween($academicYearMidPoint->copy()->subMonth(), $academicYearMidPoint);
-                    $persetujuanKrs = Carbon::instance($pengajuanKrs)->addDays($this->faker->numberBetween(1, 14))->toDateTimeString();
-
-
-                    $krsContext = new \StdClass();
-                    $krsContext->unique_key = $mahasiswa->nim . '-' . $ta->id_tahunakademik;
-                    $krsContext->mahasiswa_id = $mahasiswa->nim;
-                    $krsContext->tahun_akademik_id = $ta->id_tahunakademik;
-                    $krsContext->tanggal_pengajuan = $pengajuanKrs;
-                    $krsContext->tanggal_persetujuan = $persetujuanKrs;
-                    $krsContext->status = $statusKrs;
-                    $krsContext->catatan = $this->faker->optional(0.1)->sentence();
-                    $krsContext->created_at = $currentChunkTimestamp; 
-                    $krsContext->updated_at = $currentChunkTimestamp; 
-                    $krsContext->details_context = [];
-                    $krsContext->total_sks = 0;
-
-                    $matakuliahUntukSemesterIni = $this->groupedMataKuliahCache->get($prodiIdMahasiswa . '_' . $studentSemesterForThisTA, collect());
-
-                    if ($matakuliahUntukSemesterIni->isNotEmpty()) {
-                        $shuffledMataKuliah = $matakuliahUntukSemesterIni->shuffle();
-                        $mkYangBerhasilDitambahkan = 0;
-                        $targetJumlahMk = $this->faker->numberBetween(1, min(7, $shuffledMataKuliah->count()));
-
-                        foreach ($shuffledMataKuliah as $mk) {
-                            if ($mkYangBerhasilDitambahkan >= $targetJumlahMk) break;
-
-                            $availableKelasCacheKey = $ta->id_tahunakademik . '-' . $mk->kode_matakuliah;
-                            $availableKelases = $this->availableKelasCache[$availableKelasCacheKey] ?? collect();
-
-                            if ($availableKelases->isNotEmpty()) {
-                                $kelas = $availableKelases->random();
-                                
-                                $detailContext = new \StdClass();
-                                $detailContext->kelas_id = $kelas->id_kelas;
-                                $detailContext->created_at = $currentChunkTimestamp; 
-                                $detailContext->updated_at = $currentChunkTimestamp; 
-                                $detailContext->kelas_instance = $kelas; 
-                                
-                                $krsContext->details_context[] = $detailContext;
-                                $krsContext->total_sks += $mk->sks;
-                                $mkYangBerhasilDitambahkan++;
-
-                                $komponenConfigs = $this->getKomponenConfigs();
-                                foreach($komponenConfigs as $kConfig) {
-                                    $upsertKey = $kelas->id_kelas . '-' . $kConfig['nama_komponen'];
-                                    $komponenNilaiForChunkUpsert[$upsertKey] = [
-                                        'kelas_id' => $kelas->id_kelas,
-                                        'nama_komponen' => $kConfig['nama_komponen'],
-                                        'bobot' => $kConfig['bobot'],
-                                        'created_at' => $currentChunkTimestamp,
-                                        'updated_at' => $currentChunkTimestamp,
-                                    ];
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (!empty($krsContext->details_context) && $krsContext->total_sks > 0) {
-                        $krsContextCollection[] = $krsContext;
-                    } else {
-                        if ($matakuliahUntukSemesterIni->isNotEmpty() && empty($krsContext->details_context)) {
-                            $this->command->warn("INFO: MHS {$mahasiswa->nim} TA {$ta->tahun_akademik}/{$ta->semester} (Sem {$studentSemesterForThisTA}): MK ada, tidak ada kelas aktif. KRS tidak dibuat.");
-                        } else if ($matakuliahUntukSemesterIni->isEmpty()) {
-                            // $this->command->line("INFO: MHS {$mahasiswa->nim} TA {$ta->tahun_akademik}/{$ta->semester} (Sem {$studentSemesterForThisTA}): Tidak ada MK di kurikulum. KRS tidak dibuat.");
-                        }
-                    }
-                } 
-                $progressBar->advance();
-            } 
-
-            if (!empty($komponenNilaiForChunkUpsert)) {
-                KomponenNilai::upsert(
-                    array_values($komponenNilaiForChunkUpsert),
-                    ['kelas_id', 'nama_komponen'], 
-                    ['bobot', 'updated_at'] 
-                );
+                // Filter kelas by prodi_id (if mataKuliah.kurikulum relation exists)
+                $availableKelas = $availableKelasForTA->filter(function($kelas) use ($mahasiswaProdiId) {
+                    // Check if mataKuliah and kurikulum relation exist
+                    return $kelas->mataKuliah && $kelas->mataKuliah->kurikulum && 
+                                 $kelas->mataKuliah->kurikulum->prodi_id === $mahasiswaProdiId &&
+                                 $kelas->mataKuliah->kurikulum->is_active;
+                });
                 
-                $kelasIdsProcessed = collect($komponenNilaiForChunkUpsert)->pluck('kelas_id')->unique();
-                $namaKomponenProcessed = collect($komponenNilaiForChunkUpsert)->pluck('nama_komponen')->unique();
-                
-                if ($kelasIdsProcessed->isNotEmpty() && $namaKomponenProcessed->isNotEmpty()) {
-                    $actualKomponenNilai = KomponenNilai::whereIn('kelas_id', $kelasIdsProcessed)
-                                                        ->whereIn('nama_komponen', $namaKomponenProcessed)
-                                                        ->get();
-                    foreach($actualKomponenNilai as $kn) {
-                        $this->komponenNilaiCache[$kn->kelas_id . '-' . $kn->nama_komponen] = $kn;
-                    }
+                if ($availableKelas->isEmpty()) {
+                    $progressBar->advance();
+                    continue;
                 }
-            }
 
+                $tanggalPengajuan = Carbon::parse($ta->tanggal_mulai)->addDays($this->faker->numberBetween(0, 14));
+                $statusKRS = 'Disetujui'; // Default to approved for past semesters
+                if ($isCurrentOrFutureTA) {
+                    $statusKRS = $this->faker->randomElement(['Diajukan', 'Draft']); // Only Diajukan/Draft for current/future active TA
+                }
+                $tanggalPersetujuan = ($statusKRS === 'Disetujui') ? $tanggalPengajuan->copy()->addDays($this->faker->numberBetween(1, 5)) : null;
 
-            if (empty($krsContextCollection)) return;
+                $krsTempId = (string) Str::uuid(); // Use UUID for temporary ID for internal linking
 
-            $krsInsertBatch = [];
-            foreach ($krsContextCollection as $krsCtx) {
-                $krsInsertBatch[] = [
-                    'mahasiswa_id' => $krsCtx->mahasiswa_id,
-                    'tahun_akademik_id' => $krsCtx->tahun_akademik_id,
-                    'tanggal_pengajuan' => $krsCtx->tanggal_pengajuan,
-                    'tanggal_persetujuan' => $krsCtx->tanggal_persetujuan,
-                    'status' => $krsCtx->status,
-                    'catatan' => $krsCtx->catatan,
-                    'total_sks' => $krsCtx->total_sks,
-                    'created_at' => $krsCtx->created_at,
-                    'updated_at' => $krsCtx->updated_at,
+                $krsData = [
+                    'temp_id' => $krsTempId, // Store temporary ID for later mapping in PHP
+                    'mahasiswa_id' => $mahasiswa->nim,
+                    'tahun_akademik_id' => $ta->id_tahunakademik,
+                    'tanggal_pengajuan' => $tanggalPengajuan,
+                    'tanggal_persetujuan' => $tanggalPersetujuan,
+                    'status' => $statusKRS,
+                    'catatan' => ($this->faker->boolean(10) && $statusKRS === 'Ditolak') ? $this->faker->sentence() : null,
+                    'created_at' => $tanggalPengajuan,
+                    'updated_at' => $tanggalPersetujuan ?? $tanggalPengajuan,
+                    'total_sks' => 0, // Will be calculated and updated
+                    'temp_seed_uuid' => $krsTempId, // Store UUID in DB for mapping
                 ];
-            }
-            if (!empty($krsInsertBatch)) {
-                Krs::insert($krsInsertBatch);
-            }
+                $allKrsData[] = $krsData;
 
+                $jumlahMkDiambil = $this->faker->numberBetween($this->minKelasPerKrs, $this->maxKelasPerKrs);
+                $selectedKelas = $availableKelas->shuffle()->take($jumlahMkDiambil);
 
-            $krsIdMap = []; 
-            $mahasiswaNimsInChunk = collect($krsInsertBatch)->pluck('mahasiswa_id')->unique()->all(); // Ambil dari batch yg benar-benar akan diinsert
-            $tahunAkademikIdsInContext = collect($krsInsertBatch)->pluck('tahun_akademik_id')->unique()->all(); // Ambil dari batch
+                $currentKrsSks = 0;
+                foreach ($selectedKelas as $kelas) {
+                    // Make sure $kelas->mataKuliah exists before accessing properties
+                    $sks = $kelas->mataKuliah->sks ?? 0;
+                    $currentKrsSks += $sks;
 
-            if (!empty($krsInsertBatch)) {
-                $timeWindowStart = $currentChunkTimestamp->copy()->subSeconds(10); // Kurangi jadi 10 detik
-                $timeWindowEnd = $currentChunkTimestamp->copy()->addSeconds(10); // Kurangi jadi 10 detik
+                    $krsDetailTempId = (string) Str::uuid(); // Use UUID for temporary ID
 
-                if (!empty($mahasiswaNimsInChunk) && !empty($tahunAkademikIdsInContext)) {
-                     $insertedKrsModels = Krs::whereIn('mahasiswa_id', $mahasiswaNimsInChunk)
-                        ->whereIn('tahun_akademik_id', $tahunAkademikIdsInContext) 
-                        ->where('created_at', '>=', $timeWindowStart) 
-                        ->where('created_at', '<=', $timeWindowEnd)
-                        ->select('id_krs', 'mahasiswa_id', 'tahun_akademik_id')
-                        ->get();
-                    foreach ($insertedKrsModels as $krsModel) {
-                        $krsIdMap[$krsModel->mahasiswa_id . '-' . $krsModel->tahun_akademik_id] = $krsModel->id_krs;
+                    $krsDetailData = [
+                        'temp_id' => $krsDetailTempId, // Temporary ID for this KrsDetail in PHP
+                        'krs_id_temp' => $krsTempId, // Link to the temporary KRS ID in PHP
+                        'kelas_id' => $kelas->id_kelas,
+                        'created_at' => $tanggalPengajuan,
+                        'updated_at' => $tanggalPengajuan,
+                        'temp_seed_uuid' => $krsDetailTempId, // Store UUID in DB for mapping
+                    ];
+                    $allKrsDetailData[] = $krsDetailData;
+
+                    if ($statusKRS === 'Disetujui' && !$isCurrentOrFutureTA) {
+                        $this->prepareGradesForKrsDetail($krsDetailTempId, $kelas, $allKomponenNilaiData, $allNilaiData, $allNilaiAkhirData, $tanggalPengajuan);
                     }
                 }
-            }
-
-            $krsDetailInsertBatch = [];
-            $krsDetailInternalMap = []; 
-            foreach ($krsContextCollection as $krsCtx) {
-                $actualKrsId = $krsIdMap[$krsCtx->unique_key] ?? null;
-                if ($actualKrsId && !empty($krsCtx->details_context)) { 
-                    foreach ($krsCtx->details_context as $detailCtx) {
-                        $krsDetailInsertBatch[] = [
-                            'krs_id' => $actualKrsId,
-                            'kelas_id' => $detailCtx->kelas_id,
-                            'created_at' => $detailCtx->created_at,
-                            'updated_at' => $detailCtx->updated_at,
-                        ];
-                        $krsDetailInternalMap[$actualKrsId . '-' . $detailCtx->kelas_id] = [
-                            'kelas_instance' => $detailCtx->kelas_instance,
-                        ];
-                    }
+                // Update total_sks for the last KRS entry (which is the one just added)
+                $lastKrsIndex = count($allKrsData) - 1;
+                if ($lastKrsIndex >= 0) { // Ensure there's a KRS entry to update
+                    $allKrsData[$lastKrsIndex]['total_sks'] = $currentKrsSks;
                 }
-            }
-            if(!empty($krsDetailInsertBatch)) {
-                KrsDetail::insert($krsDetailInsertBatch);
-            }
-            
-            if (!empty($krsDetailInsertBatch)) { 
-                $krsIdsForDetailQuery = collect($krsDetailInsertBatch)->pluck('krs_id')->unique()->all();
-                $kelasIdsForDetailQuery = collect($krsDetailInsertBatch)->pluck('kelas_id')->unique()->all();
                 
-                $timeWindowStartDetail = $currentChunkTimestamp->copy()->subSeconds(10); // Kurangi jadi 10 detik
-                $timeWindowEndDetail = $currentChunkTimestamp->copy()->addSeconds(10); // Kurangi jadi 10 detik
-                
-                if (!empty($krsIdsForDetailQuery) && !empty($kelasIdsForDetailQuery)) {
-                    $insertedKrsDetailModels = KrsDetail::whereIn('krs_id', $krsIdsForDetailQuery) 
-                        ->whereIn('kelas_id', $kelasIdsForDetailQuery) 
-                        ->where('created_at', '>=', $timeWindowStartDetail)
-                        ->where('created_at', '<=', $timeWindowEndDetail)
-                        ->select('id_krsdetail', 'krs_id', 'kelas_id')
-                        ->get();
-                    foreach ($insertedKrsDetailModels as $krsDetailModel) {
-                        $mapKey = $krsDetailModel->krs_id . '-' . $krsDetailModel->kelas_id;
-                        if(isset($krsDetailInternalMap[$mapKey])) { 
-                            $krsDetailInternalMap[$mapKey]['id_krsdetail'] = $krsDetailModel->id_krsdetail;
-                        }
-                    }
-                }
+                $progressBar->advance();
             }
-
-            $nilaiToInsert = [];
-            $nilaiAkhirToInsert = [];
-            if(!empty($krsDetailInternalMap)){ 
-                foreach ($krsDetailInternalMap as $contextKey => $contextData) { 
-                    if (isset($contextData['id_krsdetail']) && $contextData['id_krsdetail']) {
-                        $mockKrsDetail = new KrsDetail(); 
-                        $mockKrsDetail->id_krsdetail = $contextData['id_krsdetail'];
-                        
-                        $nilaiData = $this->prepareDetailNilaiForBulk($mockKrsDetail, $contextData['kelas_instance'], $currentChunkTimestamp);
-                        $nilaiToInsert = array_merge($nilaiToInsert, $nilaiData['nilai']);
-                        if ($nilaiData['nilai_akhir'] !== null) {
-                            $nilaiAkhirToInsert[] = $nilaiData['nilai_akhir'];
-                        }
-                    }
-                }
-            }
-
-            if (!empty($nilaiToInsert)) {
-                Nilai::insert($nilaiToInsert);
-            }
-            if (!empty($nilaiAkhirToInsert)) {
-                NilaiAkhir::insert($nilaiAkhirToInsert);
-            }
-
-
-        }); 
+        }
 
         $progressBar->finish();
-        $this->command->line('');
-        $this->command->info('KRS and Nilai Seeding Finished.');
-        DB::enableQueryLog();
+        $this->command->info("\nAll data collected. Starting batch insertions...");
+
+        // --- Perform Batch Inserts in a Transaction ---
+        DB::transaction(function () use (
+            &$allKrsData,
+            &$allKrsDetailData,
+            &$allKomponenNilaiData,
+            &$allNilaiData,
+            &$allNilaiAkhirData,
+            &$krsTempToActualIdMap,
+            &$krsDetailTempToActualIdMap,
+            &$komponenNilaiTempToActualIdMap
+        ) {
+            // 1. Insert KRS data
+            $this->command->info("Inserting KRS records in batches...");
+            $krsInsertableData = array_map(function($item) {
+                return [
+                    'mahasiswa_id' => $item['mahasiswa_id'],
+                    'tahun_akademik_id' => $item['tahun_akademik_id'],
+                    'tanggal_pengajuan' => $item['tanggal_pengajuan'],
+                    'tanggal_persetujuan' => $item['tanggal_persetujuan'],
+                    'status' => $item['status'],
+                    'catatan' => $item['catatan'],
+                    'created_at' => $item['created_at'],
+                    'updated_at' => $item['updated_at'],
+                    'total_sks' => $item['total_sks'],
+                    'temp_seed_uuid' => $item['temp_id'], // Now using temp_id for mapping in DB
+                ];
+            }, $allKrsData);
+
+            $this->chunkInsert(DB::table('krs'), $krsInsertableData, $this->batchSize);
+            
+            // Re-fetch IDs for mapping: This is the critical optimization point.
+            $this->command->info("Mapping KRS IDs...");
+            $krsUuids = array_column($allKrsData, 'temp_id');
+            $actualKrsRecords = DB::table('krs')
+                                ->select('id_krs', 'temp_seed_uuid')
+                                ->whereIn('temp_seed_uuid', $krsUuids)
+                                ->get();
+            foreach ($actualKrsRecords as $record) {
+                $krsTempToActualIdMap[$record->temp_seed_uuid] = $record->id_krs;
+            }
+            // Clear memory for no longer needed data
+            unset($krsInsertableData);
+            unset($actualKrsRecords);
+            unset($krsUuids);
+            $this->command->info("KRS records inserted and mapped.");
+
+            // 2. Prepare and Insert KrsDetail data
+            $this->command->info("Preparing and inserting KRS Detail records...");
+            $krsDetailInsertableData = [];
+            $krsDetailUuids = [];
+            foreach ($allKrsDetailData as $item) {
+                $actualKrsId = $krsTempToActualIdMap[$item['krs_id_temp']] ?? null;
+                if ($actualKrsId) {
+                    $krsDetailInsertableData[] = [
+                        'krs_id' => $actualKrsId,
+                        'kelas_id' => $item['kelas_id'],
+                        'created_at' => $item['created_at'],
+                        'updated_at' => $item['updated_at'],
+                        'temp_seed_uuid' => $item['temp_id'], // Now using temp_id for mapping in DB
+                    ];
+                    $krsDetailUuids[] = $item['temp_id'];
+                }
+            }
+            
+            $this->chunkInsert(DB::table('krs_detail'), $krsDetailInsertableData, $this->batchSize);
+
+            // Re-fetch IDs for mapping
+            $this->command->info("Mapping KRS Detail IDs...");
+            $actualKrsDetailRecords = DB::table('krs_detail')
+                                        ->select('id_krsdetail', 'temp_seed_uuid')
+                                        ->whereIn('temp_seed_uuid', $krsDetailUuids)
+                                        ->get();
+            foreach ($actualKrsDetailRecords as $record) {
+                $krsDetailTempToActualIdMap[$record->temp_seed_uuid] = $record->id_krsdetail;
+            }
+            unset($krsDetailInsertableData);
+            unset($actualKrsDetailRecords);
+            unset($krsDetailUuids);
+            $this->command->info("KRS Detail records inserted and mapped.");
+
+            // 3. Prepare and Insert KomponenNilai data
+            $this->command->info("Preparing and inserting Komponen Nilai records...");
+            $komponenNilaiInsertableData = [];
+            $komponenNilaiUuids = [];
+            foreach ($allKomponenNilaiData as $item) {
+                $komponenNilaiInsertableData[] = [
+                    'kelas_id' => $item['kelas_id'],
+                    'nama_komponen' => $item['nama_komponen'],
+                    'bobot' => $item['bobot'],
+                    'created_at' => $item['created_at'],
+                    'updated_at' => $item['updated_at'],
+                    'temp_seed_uuid' => $item['temp_id'], // Now using temp_id for mapping in DB
+                ];
+                $komponenNilaiUuids[] = $item['temp_id'];
+            }
+
+            $this->chunkInsert(DB::table('komponen_nilai'), $komponenNilaiInsertableData, $this->batchSize);
+
+            // Re-fetch IDs for mapping
+            $this->command->info("Mapping Komponen Nilai IDs...");
+            $actualKomponenNilaiRecords = DB::table('komponen_nilai')
+                                            ->select('id_komponennilai', 'temp_seed_uuid')
+                                            ->whereIn('temp_seed_uuid', $komponenNilaiUuids)
+                                            ->get();
+            foreach ($actualKomponenNilaiRecords as $record) {
+                $komponenNilaiTempToActualIdMap[$record->temp_seed_uuid] = $record->id_komponennilai;
+            }
+            unset($komponenNilaiInsertableData);
+            unset($actualKomponenNilaiRecords);
+            unset($komponenNilaiUuids);
+            $this->command->info("Komponen Nilai records inserted and mapped.");
+
+            // 4. Prepare and Insert Nilai data
+            $this->command->info("Preparing and inserting Nilai records...");
+            $nilaiInsertableData = [];
+            foreach ($allNilaiData as $nilai) {
+                $actualKrsDetailId = $krsDetailTempToActualIdMap[$nilai['krs_detail_id']] ?? null;
+                $actualKomponenNilaiId = $komponenNilaiTempToActualIdMap[$nilai['komponen_nilai_id']] ?? null;
+                if ($actualKrsDetailId && $actualKomponenNilaiId) {
+                    $nilaiInsertableData[] = [
+                        'krs_detail_id' => $actualKrsDetailId,
+                        'komponen_nilai_id' => $actualKomponenNilaiId,
+                        'nilai_angka' => $nilai['nilai_angka'],
+                        'created_at' => $nilai['created_at'],
+                        'updated_at' => $nilai['updated_at'],
+                    ];
+                }
+            }
+            $this->chunkInsert(DB::table('nilai'), $nilaiInsertableData, $this->batchSize);
+            unset($nilaiInsertableData);
+            $this->command->info("Nilai records inserted.");
+
+            // 5. Prepare and Insert NilaiAkhir data
+            $this->command->info("Preparing and inserting Nilai Akhir records...");
+            $nilaiAkhirInsertableData = [];
+            foreach ($allNilaiAkhirData as $nilaiAkhir) {
+                $actualKrsDetailId = $krsDetailTempToActualIdMap[$nilaiAkhir['krs_detail_id']] ?? null;
+                if ($actualKrsDetailId) {
+                    $nilaiAkhirInsertableData[] = [
+                        'krs_detail_id' => $actualKrsDetailId,
+                        'nilai_angka' => $nilaiAkhir['nilai_angka'],
+                        'nilai_huruf' => $nilaiAkhir['nilai_huruf'],
+                        'created_at' => $nilaiAkhir['created_at'],
+                        'updated_at' => $nilaiAkhir['updated_at'],
+                    ];
+                }
+            }
+            $this->chunkInsert(DB::table('nilai_akhir'), $nilaiAkhirInsertableData, $this->batchSize);
+            unset($allKrsData); // Clear all collected data to free memory
+            unset($allKrsDetailData);
+            unset($allKomponenNilaiData);
+            unset($allNilaiData);
+            unset($allNilaiAkhirData);
+            unset($nilaiAkhirInsertableData);
+            $this->command->info("Nilai Akhir records inserted.");
+        });
+
+        // Re-enable foreign key checks
+        DB::statement('SET FOREIGN_KEY_CHECKS=1');
+        $this->command->info("\nKRS and Nilai Seeding Completed!");
     }
 
-    private function getKomponenConfigs(): array
-    {
-        $komponenConfigs = [
-            ['nama_komponen' => 'Tugas Harian', 'bobot' => $this->faker->numberBetween(15, 25)],
-            ['nama_komponen' => 'Ujian Tengah Semester (UTS)', 'bobot' => $this->faker->numberBetween(25, 35)],
-        ];
-        $sisaBobot = 100 - ($komponenConfigs[0]['bobot'] + $komponenConfigs[1]['bobot']);
-        $komponenConfigs[] = ['nama_komponen' => 'Ujian Akhir Semester (UAS)', 'bobot' => max(20, $sisaBobot)];
+    protected function prepareGradesForKrsDetail(
+        $krsDetailTempId,
+        Kelas $kelas,
+        &$allKomponenNilaiData,
+        &$allNilaiData,
+        &$allNilaiAkhirData,
+        $krsDetailCreatedAt
+    ) {
+        $komponenNilaiNames = ['UTS', 'UAS', 'Tugas', 'Kuis', 'Kehadiran'];
+        $komponenNilaiWeights = [];
+        $remainingWeight = 100;
 
-        $totalBobot = array_sum(array_column($komponenConfigs, 'bobot'));
-        if ($totalBobot !== 100 && $totalBobot > 0) {
-            $factor = 100 / $totalBobot;
-            $currentSumBobot = 0;
-            for ($i = 0; $i < count($komponenConfigs) - 1; $i++) {
-                $komponenConfigs[$i]['bobot'] = round($komponenConfigs[$i]['bobot'] * $factor);
-                $currentSumBobot += $komponenConfigs[$i]['bobot'];
+        shuffle($komponenNilaiNames);
+
+        // Assign weights ensuring they sum to 100
+        foreach ($komponenNilaiNames as $index => $name) {
+            if ($index === count($komponenNilaiNames) - 1) {
+                $komponenNilaiWeights[$name] = $remainingWeight;
+            } else {
+                $weight = $this->faker->numberBetween(10, min(40, $remainingWeight));
+                $komponenNilaiWeights[$name] = $weight;
+                $remainingWeight -= $weight;
             }
-            $komponenConfigs[count($komponenConfigs)-1]['bobot'] = 100 - $currentSumBobot;
         }
-        $finalBobotSum = array_sum(array_column($komponenConfigs, 'bobot'));
-        if ($finalBobotSum !== 100 && count($komponenConfigs) > 0) {
-            $komponenConfigs[count($komponenConfigs)-1]['bobot'] += (100 - $finalBobotSum);
-        }
-        return $komponenConfigs;
-    }
 
+        $totalScore = 0;
+        foreach ($komponenNilaiWeights as $name => $bobot) {
+            $komponenNilaiTempId = (string) Str::uuid(); // Use UUID for temporary ID
 
-    private function prepareDetailNilaiForBulk(KrsDetail $krsDetail, Kelas $kelas, Carbon $timestamp): array
-    {
-        $komponenConfigs = $this->getKomponenConfigs(); 
-
-        $nilaiDataArray = [];
-        $totalNilaiWeighted = 0;
-
-        foreach ($komponenConfigs as $config) {
-            if ($config['bobot'] <= 0) continue; 
-
-            $komponenNilai = $this->komponenNilaiCache[$kelas->id_kelas . '-' . $config['nama_komponen']] ?? null;
-
-            if (!$komponenNilai) {
-                $this->command->error("CRITICAL: KomponenNilai tidak ada di cache untuk Kelas ID {$kelas->id_kelas}, Komponen '{$config['nama_komponen']}'. Nilai tidak dapat dibuat. Pastikan upsert KomponenNilai berhasil & cache direfresh.");
-                continue; 
-            }
-
-            $nilaiAngkaKomponen = $this->faker->randomFloat(2, 45, 98);
-            $nilaiDataArray[] = [
-                'krs_detail_id' => $krsDetail->id_krsdetail, 
-                'komponen_nilai_id' => $komponenNilai->id_komponennilai,
-                'nilai_angka' => $nilaiAngkaKomponen,
-                'created_at' => $timestamp, 
-                'updated_at' => $timestamp, 
+            $allKomponenNilaiData[] = [
+                'temp_id' => $komponenNilaiTempId, // Temporary ID for mapping in PHP
+                'kelas_id' => $kelas->id_kelas,
+                'nama_komponen' => $name,
+                'bobot' => $bobot,
+                'created_at' => $krsDetailCreatedAt,
+                'updated_at' => $krsDetailCreatedAt,
+                'temp_seed_uuid' => $komponenNilaiTempId, // Store UUID in DB for mapping
             ];
-            $totalNilaiWeighted += ($nilaiAngkaKomponen * ($komponenNilai->bobot / 100.0));
+
+            $nilaiAngka = $this->faker->numberBetween(50, 95);
+            $allNilaiData[] = [
+                'krs_detail_id' => $krsDetailTempId, // Link to temporary KrsDetail ID (for PHP)
+                'komponen_nilai_id' => $komponenNilaiTempId, // Link to temporary KomponenNilai ID (for PHP)
+                'nilai_angka' => $nilaiAngka,
+                'created_at' => $krsDetailCreatedAt->copy()->addDays($this->faker->numberBetween(10, 60)), // Use copy to avoid modifying original Carbon instance
+                'updated_at' => $krsDetailCreatedAt->copy()->addDays($this->faker->numberBetween(10, 60)),
+            ];
+
+            $totalScore += ($nilaiAngka * ($bobot / 100));
         }
 
-        if (empty($nilaiDataArray)) {
-            return ['nilai' => [], 'nilai_akhir' => null];
-        }
+        $nilaiAkhirAngka = round($totalScore, 2);
+        $nilaiAkhirHuruf = $this->convertScoreToGrade($nilaiAkhirAngka);
 
-        $nilaiAngkaAkhir = round(max(0, min(100, $totalNilaiWeighted)), 2);
-        $nilaiHuruf = 'E';
-        if ($nilaiAngkaAkhir >= 80) $nilaiHuruf = 'A';
-        elseif ($nilaiAngkaAkhir >= 75) $nilaiHuruf = 'AB';
-        elseif ($nilaiAngkaAkhir >= 70) $nilaiHuruf = 'B';
-        elseif ($nilaiAngkaAkhir >= 65) $nilaiHuruf = 'BC';
-        elseif ($nilaiAngkaAkhir >= 60) $nilaiHuruf = 'C';
-        elseif ($nilaiAngkaAkhir >= 50) $nilaiHuruf = 'D';
-
-        $nilaiAkhirData = [
-            'krs_detail_id' => $krsDetail->id_krsdetail, 
-            'nilai_angka' => $nilaiAngkaAkhir,
-            'nilai_huruf' => $nilaiHuruf,
-            'created_at' => $timestamp, 
-            'updated_at' => $timestamp, 
+        $allNilaiAkhirData[] = [
+            'krs_detail_id' => $krsDetailTempId, // Link to temporary KrsDetail ID (for PHP)
+            'nilai_angka' => $nilaiAkhirAngka,
+            'nilai_huruf' => $nilaiAkhirHuruf,
+            'created_at' => $krsDetailCreatedAt->copy()->addDays($this->faker->numberBetween(70, 90)),
+            'updated_at' => $krsDetailCreatedAt->copy()->addDays($this->faker->numberBetween(70, 90)),
         ];
+    }
 
+    protected function convertScoreToGrade($score)
+    {
+        foreach ($this->nilaiHurufMapping as $minScore => $grade) {
+            if ($score >= $minScore) {
+                return $grade;
+            }
+        }
+        return 'E';
+    }
 
-        return ['nilai' => $nilaiDataArray, 'nilai_akhir' => $nilaiAkhirData];
+    /**
+     * Chunks and inserts data into the database.
+     *
+     * @param \Illuminate\Database\Query\Builder $queryBuilder
+     * @param array $data
+     * @param int $chunkSize
+     * @return void
+     */
+    protected function chunkInsert($queryBuilder, array $data, int $chunkSize = 1000)
+    {
+        if (empty($data)) {
+            return;
+        }
+        $tableName = $queryBuilder->from; // Get table name for logging
+        $totalChunks = ceil(count($data) / $chunkSize);
+        $this->command->info("Inserting " . count($data) . " records into {$tableName} in {$totalChunks} chunks.");
+
+        foreach (array_chunk($data, $chunkSize) as $index => $chunk) {
+            try {
+                $queryBuilder->insert($chunk);
+                // Optional: Progress indicator for large inserts
+                // $this->command->comment("Chunk " . ($index + 1) . "/" . $totalChunks . " of {$tableName} inserted.");
+            } catch (Exception $e) {
+                $this->command->error("Error inserting chunk " . ($index + 1) . " into {$tableName}: " . $e->getMessage());
+                $this->command->error("First item in failed chunk (for debugging): " . json_encode(head($chunk))); // Display first item for debugging
+                // Throw the exception to stop seeding and show error
+                throw $e; 
+            }
+        }
     }
 }

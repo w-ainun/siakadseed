@@ -24,19 +24,14 @@ abstract class BaseKrsSeeder extends Seeder
 
         $this->command->info("🔄 Membersihkan data KRS untuk angkatan $angkatan...");
 
-        // Ambil NIM mahasiswa angkatan ini
         $mahasiswaNims = Mahasiswa::where('tahun_masuk', $angkatan)->pluck('nim');
-
-        // Ambil ID KRS yang akan dihapus
         $krsIds = Krs::whereIn('mahasiswa_id', $mahasiswaNims)->pluck('id_krs');
 
-        // Hapus KRSDetail dan KRS
         KrsDetail::whereIn('krs_id', $krsIds)->delete();
         Krs::whereIn('id_krs', $krsIds)->delete();
 
         $this->command->info("✅ Data lama KRS dihapus.");
 
-        // Ambil data mahasiswa target
         $mahasiswas = Mahasiswa::where('tahun_masuk', $angkatan)->get();
         $totalKrs = $mahasiswas->count() * 8;
 
@@ -54,6 +49,8 @@ abstract class BaseKrsSeeder extends Seeder
         $bar->setFormat("📦 %current%/%max% [%bar%] %percent:3s%% | ⏱️ %elapsed:6s% elapsed, ⌛ %estimated:-6s% left");
         $bar->start();
 
+        $countInserted = 0;
+
         foreach ($mahasiswas as $mahasiswa) {
             for ($semesterKe = 1; $semesterKe <= 8; $semesterKe++) {
                 $tahun = $mahasiswa->tahun_masuk + intval(($semesterKe - 1) / 2);
@@ -62,6 +59,7 @@ abstract class BaseKrsSeeder extends Seeder
 
                 $tahunAkademik = $tahunAkademiks[$kodeTA] ?? null;
                 if (!$tahunAkademik) {
+                    // Tetap buat KRS meskipun tahun akademik tidak ditemukan
                     $bar->advance();
                     continue;
                 }
@@ -109,17 +107,24 @@ abstract class BaseKrsSeeder extends Seeder
                     $krs->update(['total_sks' => $totalSks]);
 
                     DB::commit();
+                    $countInserted++;
                 } catch (\Throwable $e) {
                     DB::rollBack();
                     report($e);
+                    $this->command->error("❌ Error buat KRS mahasiswa {$mahasiswa->nim} semester $semesterKe: " . $e->getMessage());
                 }
 
                 $bar->advance();
+
+                if ($countInserted > 0 && $countInserted % 100 === 0) {
+                    $this->command->info("📝 Telah berhasil membuat $countInserted KRS.");
+                }
             }
         }
 
         $bar->finish();
         $this->command->newLine(2);
-        $this->command->info("✅ Selesai seeding $totalKrs KRS untuk angkatan $angkatan.");
+        $this->command->info("✅ Selesai seeding $countInserted KRS untuk angkatan $angkatan.");
+        $this->command->info("📊 Total di database: " . Krs::whereIn('mahasiswa_id', $mahasiswaNims)->count() . " KRS");
     }
 }

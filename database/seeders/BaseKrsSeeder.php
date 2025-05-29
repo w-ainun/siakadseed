@@ -24,110 +24,97 @@ abstract class BaseKrsSeeder extends Seeder
         $this->faker = FakerFactory::create('id_ID');
     }
 
-    public function run()
-    {
+    public function run(){
+
         $angkatan = $this->targetAngkatan();
-        $this->command->info("Memulai seeding KRS untuk angkatan $angkatan...");
+        $this->command->info("Menghapus data KRS lama untuk angkatan $angkatan...");
 
-        $tahunAkademiks = TahunAkademik::orderBy('tahun_akademik')->orderByRaw("FIELD(semester, 'Ganjil', 'Genap')")->get();
-        $kelasList = Kelas::with('mataKuliah')->get()->keyBy('id_kelas');
+        // Ambil semua NIM mahasiswa dari angkatan ini
+        $mahasiswaNims = Mahasiswa::where('tahun_masuk', $angkatan)->pluck('nim');
 
-        if ($tahunAkademiks->isEmpty() || $kelasList->isEmpty()) {
-            $this->command->error('Data dasar tidak ditemukan. Seeder dihentikan.');
+        // Ambil semua ID KRS milik mahasiswa tersebut
+        $krsIds = DB::table('krs')->whereIn('mahasiswa_id', $mahasiswaNims)->pluck('id_krs');
+
+        // Hapus krs_detail terlebih dahulu karena ada foreign key ke krs
+        DB::table('krs_detail')->whereIn('krs_id', $krsIds)->delete();
+        DB::table('krs')->whereIn('id_krs', $krsIds)->delete();
+
+        $this->command->info("Data KRS lama dihapus. Melanjutkan proses seeding...");
+        $angkatan = $this->targetAngkatan();
+        $this->command->info("Seeding 40000 KRS untuk angkatan $angkatan...");
+
+        $tahunAkademiks = TahunAkademik::orderBy('tahun_akademik')->orderByRaw("FIELD(semester, 'Ganjil', 'Genap')")->take(8)->get();
+
+        $kelasList = Kelas::with('mataKuliah.kurikulum')->get()->groupBy('tahun_akademik_id');
+        $mahasiswas = Mahasiswa::where('tahun_masuk', $angkatan)->get()->keyBy('nim');
+
+        if ($tahunAkademiks->isEmpty() || $kelasList->isEmpty() || $mahasiswas->isEmpty()) {
+            $this->command->error('Data dasar tidak ditemukan.');
             return;
         }
 
-        $mahasiswaQuery = Mahasiswa::where('tahun_masuk', $angkatan);
-        $totalMahasiswa = $mahasiswaQuery->count();
-
-        $progressBar = $this->command->getOutput()->createProgressBar($totalMahasiswa);
+        $progressBar = $this->command->getOutput()->createProgressBar(8 * 5000);
         $progressBar->setFormatDefinition('custom', ' %current%/%max% [%bar%] %percent:3s%% -- %message% (Est: %estimated:-6s% Left: %remaining:-6s%)');
         $progressBar->setFormat('custom');
         $progressBar->start();
 
-        $krsUpdates = [];
         $krsDetailsToInsert = [];
+        $krsUpdates = [];
 
-        $mahasiswaQuery->chunkById($this->mahasiswaChunkSize, function ($mahasiswas) use ($tahunAkademiks, $kelasList, &$krsUpdates, &$krsDetailsToInsert, $progressBar) {
-            foreach ($mahasiswas as $mahasiswa) {
-                $progressBar->setMessage("Memproses {$mahasiswa->nama} ({$mahasiswa->nim})");
-                $tahunMasuk = (int) $mahasiswa->tahun_masuk;
+        foreach ($tahunAkademiks as $ta) {
+            $taKelas = $kelasList->get($ta->id_tahunakademik, collect())->filter(fn($kelas) => $kelas->mataKuliah && $kelas->mataKuliah->kurikulum);
+            $eligibleMahasiswa = $mahasiswas->filter(fn($m) => !$this->mahasiswaHasKrs($m->nim, $ta->id_tahunakademik));
 
-                $relevantTahunAkademiks = $tahunAkademiks->filter(function ($ta) use ($tahunMasuk) {
-                    $taStartYear = (int)explode('/', $ta->tahun_akademik)[0];
-                    return $taStartYear >= $tahunMasuk;
-                });
+            $eligibleNims = $eligibleMahasiswa->keys()->shuffle()->take(5000);
 
-                $semesterCount = 0;
-                foreach ($relevantTahunAkademiks as $ta) {
-                    if ($semesterCount >= 8 || !$this->faker->boolean(80)) continue;
+            foreach ($eligibleNims as $nim) {
+                $mahasiswa = $mahasiswas->get($nim);
+                $kelasPilihan = $taKelas->filter(fn($kelas) =>
+                    ($kelas->mataKuliah->kurikulum->prodi_id ?? null) === $mahasiswa->prodi_id
+                )->shuffle()->take($this->faker->numberBetween(5, 8));
 
-                    $relevantKelas = $kelasList->filter(fn($kelas) =>
-                        $kelas->tahun_akademik_id == $ta->id_tahunakademik &&
-                        ($kelas->mataKuliah->kurikulum->prodi_id ?? null) == $mahasiswa->prodi_id
-                    );
+                if ($kelasPilihan->isEmpty()) continue;
 
-                    if ($relevantKelas->isEmpty()) continue;
+                $krsId = DB::table('krs')->insertGetId([
+                    'mahasiswa_id' => $nim,
+                    'tahun_akademik_id' => $ta->id_tahunakademik,
+                    'tanggal_pengajuan' => $this->faker->dateTimeBetween($ta->tanggal_mulai, Carbon::parse($ta->tanggal_mulai)->addMonth(1)),
+                    'status' => 'Disetujui',
+                    'total_sks' => 0,
+                    'tanggal_persetujuan' => now(),
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
 
-                    $selectedKelas = $relevantKelas->shuffle()->take($this->faker->numberBetween(5, 8));
-                    if ($selectedKelas->isEmpty()) continue;
-
-                    $existing = DB::table('krs')
-                        ->where('mahasiswa_id', $mahasiswa->nim)
-                        ->where('tahun_akademik_id', $ta->id_tahunakademik)
-                        ->exists();
-
-                    if ($existing) {
-                        $progressBar->setMessage("KRS sudah ada untuk {$mahasiswa->nim} di TA {$ta->tahun_akademik}, dilewati.");
-                        continue;
-                    }
-
-                    $krsId = DB::table('krs')->insertGetId([
-                        'mahasiswa_id' => $mahasiswa->nim,
-                        'tahun_akademik_id' => $ta->id_tahunakademik,
-                        'tanggal_pengajuan' => $this->faker->dateTimeBetween($ta->tanggal_mulai, Carbon::parse($ta->tanggal_mulai)->addMonth(1))->format('Y-m-d H:i:s'),
-                        'status' => 'Disetujui',
-                        'total_sks' => 0,
-                        'tanggal_persetujuan' => now(),
+                $totalSks = 0;
+                foreach ($kelasPilihan as $kelas) {
+                    $krsDetailsToInsert[] = [
+                        'krs_id' => $krsId,
+                        'kelas_id' => $kelas->id_kelas,
                         'created_at' => now(),
                         'updated_at' => now(),
-                    ]);
-
-                    $sks = 0;
-                    foreach ($selectedKelas as $kelas) {
-                        $krsDetailsToInsert[] = [
-                            'krs_id' => $krsId,
-                            'kelas_id' => $kelas->id_kelas,
-                            'created_at' => now(),
-                            'updated_at' => now(),
-                        ];
-                        $sks += $kelas->mataKuliah->sks ?? 0;
-                    }
-                    $krsUpdates[$krsId] = $sks;
-
-                    if (count($krsDetailsToInsert) >= $this->batchSize) {
-                        DB::table('krs_detail')->insert($krsDetailsToInsert);
-                        $krsDetailsToInsert = [];
-                    }
-
-                    $semesterCount++;
+                    ];
+                    $totalSks += $kelas->mataKuliah->sks ?? 0;
                 }
+                $krsUpdates[$krsId] = $totalSks;
+
+                if (count($krsDetailsToInsert) >= $this->batchSize) {
+                    DB::table('krs_detail')->insert($krsDetailsToInsert);
+                    $krsDetailsToInsert = [];
+                }
+
                 $progressBar->advance();
             }
+        }
 
-            if (!empty($krsDetailsToInsert)) {
-                DB::table('krs_detail')->insert($krsDetailsToInsert);
-                $krsDetailsToInsert = [];
-            }
-        });
+        if (!empty($krsDetailsToInsert)) {
+            DB::table('krs_detail')->insert($krsDetailsToInsert);
+        }
 
-        $progressBar->finish();
-
-        // Update total SKS secara batch
-        $this->command->info("Mengupdate total SKS...");
-        $updateProgress = $this->command->getOutput()->createProgressBar(count($krsUpdates));
-        $updateProgress->setFormat('custom');
-        $updateProgress->start();
+        $this->command->info("\nMengupdate total SKS...");
+        $updateBar = $this->command->getOutput()->createProgressBar(count($krsUpdates));
+        $updateBar->setFormat('custom');
+        $updateBar->start();
 
         $batch = [];
         foreach ($krsUpdates as $krsId => $sks) {
@@ -135,17 +122,24 @@ abstract class BaseKrsSeeder extends Seeder
 
             if (count($batch) >= $this->batchSize) {
                 DB::table('krs')->upsert($batch, ['id_krs'], ['total_sks']);
-                $updateProgress->advance(count($batch));
+                $updateBar->advance(count($batch));
                 $batch = [];
             }
         }
 
         if (!empty($batch)) {
             DB::table('krs')->upsert($batch, ['id_krs'], ['total_sks']);
-            $updateProgress->advance(count($batch));
+            $updateBar->advance(count($batch));
         }
 
-        $updateProgress->finish();
-        $this->command->info("\nSelesai seeding angkatan {$angkatan}.");
+        $updateBar->finish();
+        $this->command->info("\nSelesai seeding.");
+    }   
+    protected function mahasiswaHasKrs($nim, $tahunAkademikId)
+    {
+        return DB::table('krs')
+            ->where('mahasiswa_id', $nim)
+            ->where('tahun_akademik_id', $tahunAkademikId)
+            ->exists();
     }
 }

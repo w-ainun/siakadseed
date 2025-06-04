@@ -4,9 +4,9 @@ namespace Database\Seeders;
 
 class Krs2021Seeder extends BaseKrsSeeder
 {
-    protected function targetAngkatan(): int
-    {
-        return 2021;
-    }
+    protected function targetAngkatan(): int { return 2021; }
+    protected function maxSemester(): int { return 8; }
 }
+
+
 

@@ -11,16 +11,17 @@ use App\Models\MataKuliah;
 use App\Models\Kelas;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\DB;
-
 use Symfony\Component\Console\Helper\ProgressBar;
 
 abstract class BaseKrsSeeder extends Seeder
 {
     abstract protected function targetAngkatan(): int;
+    abstract protected function maxSemester(): int;
 
     public function run(): void
     {
         $angkatan = $this->targetAngkatan();
+        $maxSemester = $this->maxSemester();
 
         $this->command->info("🔄 Membersihkan data KRS untuk angkatan $angkatan...");
 
@@ -33,7 +34,7 @@ abstract class BaseKrsSeeder extends Seeder
         $this->command->info("✅ Data lama KRS dihapus.");
 
         $mahasiswas = Mahasiswa::where('tahun_masuk', $angkatan)->get();
-        $totalKrs = $mahasiswas->count() * 8;
+        $totalKrs = $mahasiswas->count() * $maxSemester;
 
         if ($totalKrs === 0) {
             $this->command->warn("⚠️ Tidak ada mahasiswa untuk angkatan $angkatan.");
@@ -52,14 +53,13 @@ abstract class BaseKrsSeeder extends Seeder
         $countInserted = 0;
 
         foreach ($mahasiswas as $mahasiswa) {
-            for ($semesterKe = 1; $semesterKe <= 8; $semesterKe++) {
+            for ($semesterKe = 1; $semesterKe <= $maxSemester; $semesterKe++) {
                 $tahun = $mahasiswa->tahun_masuk + intval(($semesterKe - 1) / 2);
                 $semesterTipe = ($semesterKe % 2 === 1) ? 'Ganjil' : 'Genap';
                 $kodeTA = $tahun . '/' . ($tahun + 1) . '-' . $semesterTipe;
 
                 $tahunAkademik = $tahunAkademiks[$kodeTA] ?? null;
                 if (!$tahunAkademik) {
-                    // Tetap buat KRS meskipun tahun akademik tidak ditemukan
                     $bar->advance();
                     continue;
                 }

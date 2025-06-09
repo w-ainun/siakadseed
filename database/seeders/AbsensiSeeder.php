@@ -9,13 +9,12 @@ use App\Models\Mahasiswa;
 use App\Models\TahunAkademik;
 use Illuminate\Support\Facades\DB;
 use Faker\Factory as FakerFactory;
-use Carbon\Carbon;
 use Illuminate\Support\Facades\Log;
 
 class AbsensiSeeder extends Seeder
 {
     protected $faker;
-    protected $batchSize = 2000; // Meningkatkan ukuran batch
+    protected $batchSize = 2000;
 
     public function __construct()
     {
@@ -30,9 +29,8 @@ class AbsensiSeeder extends Seeder
         DB::table('absensi')->truncate();
         DB::statement('SET FOREIGN_KEY_CHECKS=1;');
 
-        $mahasiswas = Mahasiswa::all()->keyBy('nim'); // KeyBy untuk akses cepat
-        // Eager load mataKuliah dan kurikulum untuk filter prodi, dan keyBy
-        $kelasList = Kelas::with('mataKuliah.kurikulum')->get()->keyBy('id_kelas'); 
+        $mahasiswas = Mahasiswa::all()->keyBy('nim');
+        $kelasList = Kelas::with('mataKuliah.kurikulum')->get()->keyBy('id_kelas');
         $tahunAkademiks = TahunAkademik::all()->keyBy('id_tahunakademik');
 
         if ($mahasiswas->isEmpty() || $kelasList->isEmpty() || $tahunAkademiks->isEmpty()) {
@@ -46,27 +44,25 @@ class AbsensiSeeder extends Seeder
         $progressBar->setFormat('custom');
         $progressBar->start();
 
-        $absensiToInsert = [];
-
         foreach ($kelasList as $kelas) {
-            $progressBar->setMessage("Preparing Absensi data for Kelas: {$kelas->nama_kelas}");
+            $progressBar->setMessage("Preparing Absensi for Kelas: {$kelas->nama_kelas}");
 
             $tahunAkademik = $tahunAkademiks->get($kelas->tahun_akademik_id);
             if (!$tahunAkademik) {
-                continue; // Lewati tanpa log
+                continue;
             }
 
-            $numMeetings = $this->faker->numberBetween(14, 16); 
+            $numMeetings = $this->faker->numberBetween(14, 16);
+            $batchAbsensi = [];
 
             foreach ($mahasiswas as $mahasiswa) {
-                // Cek apakah mahasiswa ini seharusnya ada di kelas ini berdasarkan prodi
                 if (($kelas->mataKuliah->kurikulum->prodi_id ?? null) !== $mahasiswa->prodi_id) {
                     continue;
                 }
 
                 for ($pertemuan = 1; $pertemuan <= $numMeetings; $pertemuan++) {
                     $statusAbsen = $this->faker->randomElement(['Hadir', 'Hadir', 'Hadir', 'Hadir', 'Izin', 'Sakit', 'Alpa']);
-                    $absensiToInsert[] = [
+                    $batchAbsensi[] = [
                         'kelas_id' => $kelas->id_kelas,
                         'mahasiswa_id' => $mahasiswa->nim,
                         'status' => $statusAbsen,
@@ -79,34 +75,37 @@ class AbsensiSeeder extends Seeder
                         'created_at' => now()->format('Y-m-d H:i:s'),
                         'updated_at' => now()->format('Y-m-d H:i:s'),
                     ];
+
+                    if (count($batchAbsensi) >= $this->batchSize) {
+                        $this->insertBatch($batchAbsensi);
+                        $batchAbsensi = [];
+                    }
                 }
             }
+
+            if (!empty($batchAbsensi)) {
+                $this->insertBatch($batchAbsensi);
+            }
+
             $progressBar->advance();
+            Log::info("Selesai proses untuk Kelas ID: {$kelas->id_kelas} ({$kelas->nama_kelas})");
         }
+
         $progressBar->finish();
-
-        $this->command->info("\nInserting Absensi data in batches...");
-        $progressBar = $this->command->getOutput()->createProgressBar(count($absensiToInsert));
-        $progressBar->start();
-
-        // Insert semua data absensi dalam batch yang lebih besar
-        foreach (array_chunk($absensiToInsert, $this->batchSize) as $chunk) { 
-            try {
-                Absensi::insert($chunk);
-            } catch (\Illuminate\Database\QueryException $e) {
-                // Log the error if it's not a duplicate key error
-                if (!str_contains($e->getMessage(), 'unique_absensi_kelas_mahasiswa_pertemuan')) {
-                    Log::error("Error inserting absensi batch: " . $e->getMessage());
-                    throw $e;
-                } else {
-                    // Ini normal jika ada duplikat karena random generation
-                    Log::warning("Duplicate absensi entry detected for batch. Skipping duplicates.");
-                }
-            }
-            $progressBar->advance(count($chunk));
-        }
-        $progressBar->finish();
-
         $this->command->info("\nSeeding Absensi selesai.");
+    }
+
+    protected function insertBatch(array $data)
+    {
+        try {
+            Absensi::insert($data);
+        } catch (\Illuminate\Database\QueryException $e) {
+            if (!str_contains($e->getMessage(), 'unique_absensi_kelas_mahasiswa_pertemuan')) {
+                Log::error("Gagal insert batch absensi: " . $e->getMessage());
+                throw $e;
+            } else {
+                Log::warning("Terdeteksi duplikat absensi. Batch dilewati.");
+            }
+        }
     }
 }
